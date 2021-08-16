@@ -1,0 +1,26 @@
+{
+    "threads" : 8,
+    "docker" : false,
+    "debug" : false,
+    "ignore_names" : [
+        "config.json",
+        "access.json"
+    ],
+    "ignore_folders" : [],
+    "extensions" : [
+        "json",
+        "mp3",
+        "ogg",
+        "flac",
+        "wav",
+        "m4a"
+    ],
+    "sources" : [
+        "/home/torchlight_ze/"
+    ],
+    "ftp_protocol" : "ftp",
+    "ftp_host" : "127.0.0.1",
+    "ftp_path" : "/torchlight/css_ze",
+    "ftp_user" : "example",
+    "ftp_password" : "examplepass"
+}

@@ -1,0 +1,37 @@
+{
+    "threads" : 8,
+    "docker" : false,
+    "debug" : false,
+    "autoremove" : {
+        "local": {
+            "days": 7,
+            "minutes": 0,
+            "seconds": 0,
+            "remove": true,
+            "autoclean": true
+        },
+        "remote": {
+            "days": 7,
+            "minutes": 0,
+            "seconds": 0,
+            "startup_clean": true,
+            "remove": true,
+            "autoclean": true
+        },
+        "priority": "remote",
+        "after_upload": true
+    },
+    "ignore_names" : [],
+    "ignore_folders" : [],
+    "extensions" : [
+        "dem"
+    ],
+    "sources" : [
+        "/home/css_ze/cstrike/demos"
+    ],
+    "ftp_protocol" : "ftp",
+    "ftp_host" : "127.0.0.1",
+    "ftp_path" : "/fastdl/css_ze",
+    "ftp_user" : "example",
+    "ftp_password" : "examplepass"
+}

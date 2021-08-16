@@ -1,0 +1,53 @@
+{
+    "threads" : 8,
+    "docker" : false,
+    "debug" : false,
+    "ignore_names" : ["ar_baggage.bsp", "ar_monastery.bsp", "ar_shoots.bsp",
+        "cs_assault.bsp", "cs_compound.bsp", "cs_havana.bsp",
+        "cs_italy.bsp", "cs_militia.bsp", "cs_office.bsp",
+        "de_aztec.bsp", "de_bank.bsp", "de_cache.bsp",
+        "de_cbble.bsp", "de_chateau.bsp", "de_dust.bsp",
+        "de_dust2.bsp", "de_inferno.bsp", "de_lake.bsp",
+        "de_mirage.bsp", "de_nuke.bsp", "de_overpass.bsp",
+        "de_piranesi.bsp", "de_port.bsp", "de_prodigy.bsp",
+        "de_safehouse.bsp", "de_shortdust.bsp", "de_shorttrain.bsp",
+        "de_stmarc.bsp", "de_sugarcane.bsp", "de_tides.bsp",
+        "de_train.bsp", "de_vertigo.bsp", "training1.bsp",
+        "test_hardware.bsp", "test_speakers.bsp",
+
+        "ar_baggage.nav", "ar_monastery.nav", "ar_shoots.nav",
+        "cs_assault.nav", "cs_compound.nav", "cs_havana.nav",
+        "cs_italy.nav", "cs_militia.nav", "cs_office.nav",
+        "de_aztec.nav", "de_bank.nav", "de_cache.nav",
+        "de_cbble.nav", "de_chateau.nav", "de_dust.nav",
+        "de_dust2.nav", "de_inferno.nav", "de_lake.nav",
+        "de_mirage.nav", "de_nuke.nav", "de_overpass.nav",
+        "de_piranesi.nav", "de_port.nav", "de_prodigy.nav",
+        "de_safehouse.nav", "de_shortdust.nav", "de_shorttrain.nav",
+        "de_stmarc.nav", "de_sugarcane.nav", "de_tides.nav",
+        "de_train.nav", "de_vertigo.nav", "training1.nav",
+        "test_hardware.nav", "test_speakers.nav"
+    ],
+    "ignore_folders" : [
+        "workshop"
+    ],
+    "extensions" : [
+        "bsp", "nav",
+        "mdl", "vtx", "vvd", "phy",
+        "vtf", "vmt", "png",
+        "wav", "mp3",
+        "pcf",
+        "ttf", "otf"
+    ],
+    "sources" : [
+        "/home/css_ze/cstrike/maps",
+        "/home/css_ze/cstrike/materials",
+        "/home/css_ze/cstrike/models",
+        "/home/css_ze/cstrike/sound"
+    ],
+    "ftp_protocol" : "ftp",
+    "ftp_host" : "127.0.0.1",
+    "ftp_path" : "/fastdl/css_ze",
+    "ftp_user" : "example",
+    "ftp_password" : "examplepass"
+}
