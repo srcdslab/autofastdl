@@ -12,6 +12,7 @@ import shutil
 import string
 import sys
 import threading
+from time import sleep
 import traceback
 from typing import Any, Dict, List, Tuple
 
@@ -213,14 +214,28 @@ class FTPHelper:
             job = jobs.get()
 
             try:
-                try:
-                    ftp.voidcmd("NOOP")
-                except Exception as e:
-                    Logger.PrettyPrint(
-                        "Error sending a NOOP cmd ({0})".format(e), "", "error"
-                    )
-                    Logger.PrettyPrint("Reconnecting...", "", "info")
-                    ftp = FTPHelper.GetConnection()
+                retry = 0
+                retry_max = 10
+                infinite_retry = True
+                while retry < retry_max:
+                    try:
+                        ftp.voidcmd("NOOP")
+                        break
+                    except Exception as e:
+                        Logger.PrettyPrint(
+                            "Error sending a NOOP cmd ({0})".format(e), "", "error"
+                        )
+                        Logger.PrettyPrint(
+                            f"Trying to reconnect...[{retry}/{retry_max}", "", "info"
+                        )
+                        sleep(1)
+                        try:
+                            ftp = FTPHelper.GetConnection()
+                        except Exception:
+                            pass
+
+                    if not infinite_retry:
+                        retry += 1
 
                 if config["debug"]:
                     Logger.PrettyPrint(
@@ -229,11 +244,13 @@ class FTPHelper:
 
                 job[0](ftp, job[1:])
 
+                jobs.task_done()
+
             except Exception as e:
                 Logger.PrettyPrint("worker error {0}".format(e), "", "error")
                 Logger.PrettyPrint(traceback.format_exc(), "", "error")
-            finally:
-                jobs.task_done()
+                # Put back job in queue if job fails
+                jobs.put(job)
 
         ftp.quit()
 
