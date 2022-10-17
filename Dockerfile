@@ -1,10 +1,9 @@
 FROM frolvlad/alpine-python3
 
-WORKDIR /usr/src/app
+WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
 
-COPY autofastdl.py /usr/src/app/autofastdl.py
+RUN pip install --no-cache-dir --prefer-binary .
 
-CMD ["python", "./autofastdl.py"]
+CMD ["autofastdl"]
