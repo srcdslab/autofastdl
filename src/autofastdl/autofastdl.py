@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3.5
+#!/usr/local/bin/python3.8
 import bz2
 import datetime
 import ftplib
@@ -14,7 +14,7 @@ import sys
 import threading
 from time import sleep
 import traceback
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyinotify
 from colorama import Fore, Style
@@ -37,7 +37,7 @@ def random_string(length: int) -> str:
     return "".join(random.choice(string.ascii_letters) for m in range(length))
 
 
-def static_var(varname: str, value: int):
+def static_var(varname: str, value: Optional[Any] = None):
     def decorate(func):
         setattr(func, varname, value)
         return func
@@ -160,18 +160,18 @@ class FTPHelper:
             path = os.path.dirname(path)
 
     # This is called a lot during startup.
-    @static_var("cache_path", 0)
-    @static_var("cache_resp", 0)
-    @static_var("cache_ftp", 0)
     @staticmethod
+    @static_var("cache_path")
+    @static_var("cache_resp")
+    @static_var("cache_ftp")
     def file_exists(ftp: ftplib.FTP, path: str) -> bool:
         Exists = False
         try:
             # Cache should only be valid for one ftp connection
             if FTPHelper.file_exists.cache_ftp != ftp:
                 FTPHelper.file_exists.cache_ftp = ftp
-                FTPHelper.file_exists.cache_path = 0
-                FTPHelper.file_exists.cache_resp = 0
+                FTPHelper.file_exists.cache_path = None
+                FTPHelper.file_exists.cache_resp = None
 
             if FTPHelper.file_exists.cache_path != os.path.dirname(path):
                 FTPHelper.file_exists.cache_path = os.path.dirname(path)
