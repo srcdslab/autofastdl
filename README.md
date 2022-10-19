@@ -40,11 +40,11 @@ The following parameters are those you can find in the [config.json](./config.ex
 version: '3.7'
 
 services:
-  portainer:
-    image: registry.gitlab.com/counterstrikesource/autofastdl:latest
+  autofastdl:
+    image: ghcr.io/srcdslab/autofastdl:latest
     container_name: autofastdl_css_ze
     volumes:
-      - /home/portainer/autofastdl_css_ze/config.json:/usr/src/app/config.json
+      - /home/portainer/autofastdl_css_ze/config.json:/app/config.json
       - /home/portainer/css_ze/serverfiles/cstrike/maps:/home/portainer/css_ze/serverfiles/cstrike/maps
       - /home/portainer/css_ze/serverfiles/cstrike/sound:/home/portainer/css_ze/serverfiles/cstrike/sound
       - /home/portainer/css_ze/serverfiles/cstrike/materials:/home/portainer/css_ze/serverfiles/cstrike/materials
