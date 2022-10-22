@@ -20,7 +20,6 @@ from types import TracebackType
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type
 
 import pyinotify
-import typing_extensions
 from dateutil import parser
 
 logger = logging.getLogger(__name__)
@@ -753,9 +752,8 @@ class DirectoryHandler:
         type: Optional[Type[BaseException]],
         value: Optional[BaseException],
         traceback: Optional[TracebackType],
-    ) -> typing_extensions.Literal[False]:
+    ) -> None:
         self.WatchManager.rm_watch(self.NotifyWatch, rec=True)
-        return False
 
     def Loop(self) -> None:
         self.NotifyNotifier.process_events()
