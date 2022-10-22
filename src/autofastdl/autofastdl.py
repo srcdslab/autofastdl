@@ -103,10 +103,10 @@ class FTPHelper:
             path = os.path.dirname(path)
 
     # This is called a lot during startup.
+    @staticmethod
     @static_var("cache_path")
     @static_var("cache_resp")
     @static_var("cache_ftp")
-    @staticmethod
     def file_exists(ftp: ftplib.FTP, path: str) -> bool:
         Exists = False
         try:
