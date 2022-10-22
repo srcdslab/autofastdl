@@ -23,7 +23,7 @@ with open(rel("src", "autofastdl", "__init__.py")) as f:
         raise RuntimeError("Version marker not found.")
 
 
-dependencies = ["pyinotify", "python-dateutil", "colorama", "pytz"]
+dependencies = ["pyinotify", "python-dateutil"]
 
 extra_dependencies: Dict[str, List[str]] = {}
 

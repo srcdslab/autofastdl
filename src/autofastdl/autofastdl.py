@@ -1,9 +1,10 @@
-#!/usr/local/bin/python3.8
+from __future__ import annotations
+
 import bz2
 import datetime
 import ftplib
 import json
-import math
+import logging
 import os
 import pathlib
 import queue
@@ -12,13 +13,17 @@ import shutil
 import string
 import sys
 import threading
-from time import sleep
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from pyclbr import Function
+from time import sleep
+from types import TracebackType
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type
 
 import pyinotify
-from colorama import Fore, Style
+import typing_extensions
 from dateutil import parser
+
+logger = logging.getLogger(__name__)
 
 config: Dict[str, Any]
 commonprefix_ftp: str
@@ -37,75 +42,12 @@ def random_string(length: int) -> str:
     return "".join(random.choice(string.ascii_letters) for m in range(length))
 
 
-def static_var(varname: str, value: Optional[Any] = None):
-    def decorate(func):
+def static_var(varname: str, value: Optional[Any] = None) -> Callable:
+    def decorate(func: Function) -> Function:
         setattr(func, varname, value)
         return func
 
     return decorate
-
-
-class Logger:
-    @staticmethod
-    def ListColoramaColors() -> None:
-        from colorama import Fore
-        from colorama import init as colorama_init
-
-        colorama_init(autoreset=True)
-
-        colors = dict(Fore.__dict__.items())
-
-        for color in colors.keys():
-            print(colors[color] + f"{color}")
-
-    @staticmethod
-    def PrettyPrint(filename, status, tag="autofastdl"):
-        if status == "Exists":
-            color = Fore.WHITE
-        elif status == "Added" or status == "Started":
-            color = Fore.LIGHTMAGENTA_EX
-        elif status == "Done" or status == "Moved" or status == "Moved":
-            color = Fore.GREEN
-        elif status == "Outdated":
-            color = Fore.YELLOW
-        elif status.startswith("process_") or status == "Keeping":
-            color = Fore.LIGHTCYAN_EX
-        else:
-            color = Fore.RED
-
-        mytime_text = str(datetime.datetime.now())
-        tag_text = str("[" + tag + " @ " + mytime_text + "] ").upper()
-        tag_color = Fore.CYAN
-        filename_color = Fore.RESET
-
-        if "docker" in config and config["docker"]:
-            text_status = "  =>  " + color + status
-            if status == "":
-                text_status = ""
-            text = (
-                tag_color
-                + tag_text
-                + filename_color
-                + filename
-                + text_status
-                + Style.RESET_ALL
-            )
-            print(text + "\n")
-        else:
-            columns = int(os.popen("stty size", "r").read().split()[1])
-            rows = math.ceil((len(filename) + len(status)) / columns)
-            text = (
-                tag_color
-                + tag_text
-                + filename_color
-                + filename
-                + "." * (columns * rows - (len(tag_text) + len(filename) + len(status)))
-                + color
-                + status
-                + Style.RESET_ALL
-            )
-            text += chr(8) * (len(text) + 1)
-            print(text + "\n" * rows)
 
 
 class FTPHelper:
@@ -117,8 +59,8 @@ class FTPHelper:
     @staticmethod
     def GetConnection() -> ftplib.FTP:
         if not config["ftp_protocol"] == "ftp":
-            Logger.PrettyPrint("FTP protocol not supported!", "ERROR")
-            sys.exit(1)
+            logger.error("FTP protocol not supported!")
+            sys.exit(84)
 
         ftp = ftplib.FTP(config["ftp_host"])
         ftp.login(config["ftp_user"], config["ftp_password"])
@@ -147,7 +89,9 @@ class FTPHelper:
             return dirs, nondirs
 
     @staticmethod
-    def walk(ftp: ftplib.FTP, path: str = "/"):
+    def walk(
+        ftp: ftplib.FTP, path: str = "/"
+    ) -> Generator[Tuple[str, List[str], List[str]], None, None]:
         """
         Walk through FTP server's directory tree, based on a BFS algorithm.
         """
@@ -160,10 +104,10 @@ class FTPHelper:
             path = os.path.dirname(path)
 
     # This is called a lot during startup.
-    @staticmethod
     @static_var("cache_path")
     @static_var("cache_resp")
     @static_var("cache_ftp")
+    @staticmethod
     def file_exists(ftp: ftplib.FTP, path: str) -> bool:
         Exists = False
         try:
@@ -190,7 +134,7 @@ class FTPHelper:
         return Exists
 
     @staticmethod
-    def dir_exists(ftp, path):
+    def dir_exists(ftp: ftplib.FTP, path: str) -> bool:
         Exists = False
         try:
             resp: List[str] = []
@@ -215,42 +159,40 @@ class FTPHelper:
 
             try:
                 retry = 0
+                sleep_seconds = 10
                 retry_max = 10
-                infinite_retry = True
                 while retry < retry_max:
                     try:
                         ftp.voidcmd("NOOP")
                         break
                     except Exception as e:
-                        Logger.PrettyPrint(
-                            "Error sending a NOOP cmd ({0})".format(e), "", "error"
+                        logger.warning("Failed sending a NOOP command ({0})".format(e))
+                        logger.info(
+                            f"Trying to reconnect in {sleep_seconds} seconds [{retry}/{retry_max}]",
                         )
-                        Logger.PrettyPrint(
-                            f"Trying to reconnect...[{retry}/{retry_max}", "", "info"
-                        )
-                        sleep(1)
+                        sleep(sleep_seconds)
                         try:
                             ftp = FTPHelper.GetConnection()
                         except Exception:
                             pass
 
-                    if not infinite_retry:
-                        retry += 1
+                    retry += 1
 
-                if config["debug"]:
-                    Logger.PrettyPrint(
-                        "Job: {0}({1})".format(job[0].__name__, job[1]), "", "debug"
+                if retry > retry_max:
+                    logger.error(
+                        "Failed too many times trying to reconnect to the FTP, exiting",
                     )
+                    sys.exit(84)
+
+                logger.debug("Job: {0}({1})".format(job[0].__name__, job[1]))
 
                 job[0](ftp, job[1:])
 
-                jobs.task_done()
-
             except Exception as e:
-                Logger.PrettyPrint("worker error {0}".format(e), "", "error")
-                Logger.PrettyPrint(traceback.format_exc(), "", "error")
-                # Put back job in queue if job fails
-                jobs.put(job)
+                logger.error("worker error {0}".format(e))
+                logger.error(traceback.format_exc())
+
+            jobs.task_done()
 
         ftp.quit()
 
@@ -265,17 +207,17 @@ class AutoRemove:
     files_removed_after_upload: List[str] = []
 
     @staticmethod
-    def HandleFileUploaded(filepath, commonprefix):
+    def HandleFileUploaded(filepath: str, commonprefix: str) -> None:
         if AutoRemove.IsFileRemovedAfterUpload():
             with AutoRemove.files_removed_after_upload_lock:
                 AutoRemove.files_removed_after_upload += [os.path.abspath(filepath)]
-                Logger.PrettyPrint(
-                    os.path.relpath(filepath, commonprefix), "Deleted", "local"
+                logger.info(
+                    f"Local file {os.path.relpath(filepath, commonprefix)} deleted"
                 )
                 os.remove(filepath)
 
     @staticmethod
-    def WasFileRemovedAfterUpload(filepath):
+    def WasFileRemovedAfterUpload(filepath: str) -> bool:
         if AutoRemove.IsFileRemovedAfterUpload():
             with AutoRemove.files_removed_after_upload_lock:
                 for filepath_removed in AutoRemove.files_removed_after_upload:
@@ -285,7 +227,7 @@ class AutoRemove:
         return False
 
     @staticmethod
-    def CheckAllFiles(ftp, sourcedir, destdir):
+    def CheckAllFiles(ftp: ftplib.FTP, sourcedir: str, destdir: str) -> None:
         if not AutoRemove.IsAutoCleaned(
             AutoRemove.configFTP
         ) and not AutoRemove.IsAutoCleaned(AutoRemove.configLocal):
@@ -301,9 +243,7 @@ class AutoRemove:
                     jobs.put((AsyncFunc.CheckDirFTP, destdirectory))
 
                 if AutoRemove.IsAutoCleaned(AutoRemove.configLocal):
-                    Logger.PrettyPrint(
-                        "AutoCleanup in " + sourcedir, "Started", "local"
-                    )
+                    logger.info(f"Local auto cleanup in {sourcedir} started")
                     filenames.sort()
                     for filename in [
                         f
@@ -342,24 +282,22 @@ class AutoRemove:
                                     None,
                                 )
                             )
-                    Logger.PrettyPrint("AutoCleanup in " + sourcedir, "Done", "local")
+                    logger.info(f"Local auto cleanup in {sourcedir} done")
 
     @staticmethod
-    def CheckDirFTP(ftp, sourcedir, threaded=False):
-        method = AutoRemove.configFTP
-
-        if not AutoRemove.IsStartupClean(method):
+    def CheckDirFTP(ftp: ftplib.FTP, sourcedir: str, threaded: bool = False) -> None:
+        if not AutoRemove.IsStartupClean(AutoRemove.configFTP):
             return
 
-        Logger.PrettyPrint("Cleanup in " + sourcedir, "Started", method)
+        logger.info(f"Remote cleanup in {sourcedir} started")
 
-        ftp_extensions: Tuple[str] = ()
+        ftp_extensions: List[str] = []
         for ext in config["extensions"]:
-            ftp_extensions += (ext + ".bz2",)
+            ftp_extensions.append(f"{ext}.bz2")
 
-        ftp_ignore_names: Tuple[str] = ()
+        ftp_ignore_names: List[str] = []
         for ign_name in config["ignore_names"]:
-            ftp_ignore_names += (ign_name + ".bz2",)
+            ftp_ignore_names.append(f"{ign_name}.bz2")
 
         for dirpath, _dirnames, filenames in FTPHelper.walk(ftp, sourcedir):
             if not any(folder in dirpath for folder in config["ignore_folders"]):
@@ -367,7 +305,7 @@ class AutoRemove:
                 for filename in [
                     f
                     for f in filenames
-                    if f.endswith(ftp_extensions) and f not in ftp_ignore_names
+                    if f.endswith(tuple(ftp_extensions)) and f not in ftp_ignore_names
                 ]:
                     if threaded:
                         jobs.put(
@@ -381,10 +319,16 @@ class AutoRemove:
                     else:
                         AutoRemove.CheckFileFTP(ftp, dirpath + "/" + filename, dirpath)
 
-        Logger.PrettyPrint("Cleanup", "Done", method)
+        logger.info(f"Cleanup in {sourcedir} done")
 
     @staticmethod
-    def CheckFile(ftp, sourcefile, destfile, sourcecommonprefix, destcommonprefix):
+    def CheckFile(
+        ftp: ftplib.FTP,
+        sourcefile: str,
+        destfile: str,
+        sourcecommonprefix: str,
+        destcommonprefix: str,
+    ) -> None:
         if AutoRemove.configName in config:
             filedatetime = None
             if (
@@ -406,63 +350,70 @@ class AutoRemove:
             AutoRemove.CheckFileLocal(sourcefile, sourcecommonprefix, filedatetime)
 
     @staticmethod
-    def GetTimestampFTP(ftp, myfile):
+    def GetTimestampFTP(ftp: ftplib.FTP, myfile: str) -> datetime.datetime:
         timestamp = ftp.sendcmd("MDTM " + myfile)[4:].strip()
         return parser.parse(timestamp)
 
     @staticmethod
-    def GetTimestampFile(myfile):
+    def GetTimestampFile(myfile: str) -> datetime.datetime:
         fname = pathlib.Path(myfile)
         return datetime.datetime.fromtimestamp(fname.stat().st_mtime)
 
     @staticmethod
-    def CheckFileFTP(ftp, myfile, commonprefix, filedatetime=None):
+    def CheckFileFTP(
+        ftp: ftplib.FTP,
+        myfile: str,
+        commonprefix: str,
+        filedatetime: Optional[datetime.datetime] = None,
+    ) -> bool:
         method = AutoRemove.configFTP
 
         if not isinstance(filedatetime, datetime.datetime):
             filedatetime = AutoRemove.GetTimestampFTP(ftp, myfile)
 
         if AutoRemove.IsOutdated(filedatetime, method):
-            Logger.PrettyPrint(
-                os.path.basename(myfile) + " (" + str(filedatetime) + ")",
-                "Outdated",
-                method,
+            logger.info(
+                f"{method.capitalize()} file {os.path.basename(myfile)} outdated ({str(filedatetime)})",
             )
             if AutoRemove.IsFileRemoved(method):
                 ftp.delete(myfile)
-                Logger.PrettyPrint(myfile, "Deleted", method)
+                logger.info(
+                    f"{method.capitalize()} file {os.path.basename(myfile)} deleted"
+                )
                 return False
             else:
-                Logger.PrettyPrint(myfile, "Keeping", method)
+                logger.info(
+                    f"{method.capitalize()} file {os.path.basename(myfile)} kept"
+                )
         return True
 
     @staticmethod
-    def CheckFileLocal(myfile, commonprefix, filedatetime=None):
+    def CheckFileLocal(
+        myfile: str, commonprefix: str, filedatetime: Optional[datetime.datetime] = None
+    ) -> bool:
         method = AutoRemove.configLocal
 
         if not isinstance(filedatetime, datetime.datetime):
             filedatetime = AutoRemove.GetTimestampFile(myfile)
 
         if AutoRemove.IsOutdated(filedatetime, method):
-            Logger.PrettyPrint(
-                os.path.basename(myfile) + " (" + str(filedatetime) + ")",
-                "Outdated",
-                method,
+            logger.info(
+                f"{method.capitalize()} file {os.path.basename(myfile)} outdated ({str(filedatetime)})",
             )
             if AutoRemove.IsFileRemoved(method):
                 os.remove(myfile)
-                Logger.PrettyPrint(
-                    os.path.relpath(myfile, commonprefix), "Deleted", method
+                logger.info(
+                    f"{method.capitalize()} file {os.path.relpath(myfile, commonprefix)} deleted"
                 )
                 return False
             else:
-                Logger.PrettyPrint(
-                    os.path.relpath(myfile, commonprefix), "Keeping", method
+                logger.info(
+                    f"{method.capitalize()} file {os.path.relpath(myfile, commonprefix)} kept"
                 )
         return True
 
     @staticmethod
-    def IsOutdated(mydatetime, method):
+    def IsOutdated(mydatetime: datetime.datetime, method: str) -> bool:
         if AutoRemove.configName in config and method in config[AutoRemove.configName]:
             checkTimeDelta = datetime.timedelta(minutes=0)
             if "days" in config[AutoRemove.configName][method]:
@@ -488,11 +439,11 @@ class AutoRemove:
         return False
 
     @staticmethod
-    def IsConfigGood(method) -> bool:
+    def IsConfigGood() -> bool:
         return AutoRemove.configName in config
 
     @staticmethod
-    def IsFileRemoved(method) -> bool:
+    def IsFileRemoved(method: str) -> bool:
         return (
             AutoRemove.configName in config
             and method in config[AutoRemove.configName]
@@ -509,7 +460,7 @@ class AutoRemove:
         )
 
     @staticmethod
-    def IsStartupClean(method) -> bool:
+    def IsStartupClean(method: str) -> bool:
         return (
             AutoRemove.configName in config
             and method in config[AutoRemove.configName]
@@ -518,7 +469,7 @@ class AutoRemove:
         )
 
     @staticmethod
-    def IsAutoCleaned(method) -> bool:
+    def IsAutoCleaned(method: str) -> bool:
         return (
             AutoRemove.configName in config
             and method in config[AutoRemove.configName]
@@ -527,7 +478,7 @@ class AutoRemove:
         )
 
     @staticmethod
-    def GetTimezone(method, name) -> bool:
+    def GetTimezone(method: str, name: str) -> bool:
         return (
             AutoRemove.configName in config
             and method in config[AutoRemove.configName]
@@ -538,7 +489,7 @@ class AutoRemove:
 
 class AsyncFunc:
     @staticmethod
-    def CheckFile(ftp, item) -> None:
+    def CheckFile(ftp: ftplib.FTP, item: Tuple[str, str, str, str]) -> None:
         sourcefile, destfile, sourcecommonprefix, destcommonprefix = item
 
         AutoRemove.CheckFile(
@@ -546,40 +497,42 @@ class AsyncFunc:
         )
 
     @staticmethod
-    def CheckFileFTP(ftp, item) -> None:
+    def CheckFileFTP(ftp: ftplib.FTP, item: Tuple[str, str, datetime.datetime]) -> None:
         myfile, commonprefix, filedatetime = item
 
         AutoRemove.CheckFileFTP(ftp, myfile, commonprefix, filedatetime)
 
     @staticmethod
-    def CheckFileLocal(ftp, item) -> None:
+    def CheckFileLocal(
+        ftp: ftplib.FTP, item: Tuple[str, str, datetime.datetime]
+    ) -> None:
         myfile, commonprefix, filedatetime = item
 
         AutoRemove.CheckFileLocal(myfile, commonprefix, filedatetime)
 
     @staticmethod
-    def CheckDirFTP(ftp, item):
+    def CheckDirFTP(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
         sourcedir = item[0]
 
         AutoRemove.CheckDirFTP(ftp, sourcedir, True)
 
     @staticmethod
-    def CheckFileAdd(ftp, item):
+    def CheckFileAdd(ftp: ftplib.FTP, item: Tuple[str, str, str]) -> None:
         sourcefile, commonprefix, destfile = item
         if AutoRemove.CheckFileLocal(sourcefile, commonprefix):
-            Logger.PrettyPrint(
-                os.path.relpath(sourcefile, commonprefix), "Added", "remote"
+            logger.info(
+                f"Local file {os.path.relpath(sourcefile, commonprefix)} added to queue"
             )
             jobs.put((AsyncFunc.Compress, sourcefile, destfile))
 
     @staticmethod
-    def CheckAllFiles(ftp, item):
+    def CheckAllFiles(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
         sourcedir, destdir = item
 
         AutoRemove.CheckAllFiles(ftp, sourcedir, destdir)
 
     @staticmethod
-    def Compress(ftp, item):
+    def Compress(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
         sourcefile, destfile = item
         # Remove destination file if already exists
         if FTPHelper.file_exists(ftp, destfile):
@@ -623,14 +576,14 @@ class AsyncFunc:
             with open(tempfile, "rb") as temp:
                 ftp.storbinary("STOR {0}".format(destfile), temp)
 
-            Logger.PrettyPrint(
-                os.path.relpath(sourcefile, commonprefix), "Done", "remote"
+            logger.info(
+                f"Local file {os.path.relpath(sourcefile, commonprefix)} uploaded to remote"
             )
             AutoRemove.HandleFileUploaded(sourcefile, commonprefix)
         except Exception:
-            print("Unexpected error:", sys.exc_info())
-            Logger.PrettyPrint(
-                os.path.relpath(sourcefile, commonprefix), "Failed (Skipping)", "remote"
+            logger.error(f"Unexpected error:\n{str(sys.exc_info())}")
+            logger.warn(
+                f"Local file {os.path.relpath(sourcefile, commonprefix)} failed to upload to remote (Skipping)"
             )
 
         os.remove(tempfile)
@@ -638,20 +591,20 @@ class AsyncFunc:
         os.rmdir(folder)
 
     @staticmethod
-    def Delete(ftp, item):
-        item = item[0]
+    def Delete(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
+        path = item[0]
 
         try:
-            ftp.delete(item)
+            ftp.delete(path)
 
-            Logger.PrettyPrint(
-                os.path.relpath(item, commonprefix_ftp), "Deleted", "remote"
+            logger.info(
+                f"Remote file {os.path.relpath(path, commonprefix_ftp)} deleted"
             )
         except ftplib.error_perm:
             pass
 
     @staticmethod
-    def Move(ftp, item):
+    def Move(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
         sourcepath, destpath = item
 
         # Check whether directory tree exists at destination, create it if necessary
@@ -661,23 +614,21 @@ class AsyncFunc:
 
         ftp.rename(sourcepath, destpath)
 
-        Logger.PrettyPrint(
-            "{0} -> {1}".format(
+        logger.info(
+            "Remote file moved {0} -> {1}".format(
                 os.path.relpath(sourcepath, commonprefix_ftp),
                 os.path.relpath(destpath, commonprefix_ftp),
             ),
-            "Moved",
-            "remote",
         )
 
 
 class EventHandler(pyinotify.ProcessEvent):
-    def my_init(self, source, destination) -> None:
+    def my_init(self, source: str, destination: str) -> None:
         self.SourceDirectory = os.path.abspath(source)
         self.DestinationDirectory = os.path.abspath(destination)
 
-    def process_IN_CLOSE_WRITE(self, event) -> None:
-        Logger.PrettyPrint(str(event), "process_IN_CLOSE_WRITE", "info")
+    def process_IN_CLOSE_WRITE(self, event: pyinotify.ProcessEvent) -> None:
+        logger.debug(f"process_IN_CLOSE_WRITE: {str(event)}")
         if (
             not event.pathname.endswith(config["extensions"])
             or os.path.basename(event.pathname) in config["ignore_names"]
@@ -691,8 +642,8 @@ class EventHandler(pyinotify.ProcessEvent):
         )
         jobs.put((AsyncFunc.Compress, event.pathname, destpath + ".bz2"))
 
-    def process_IN_DELETE(self, event) -> None:
-        Logger.PrettyPrint(str(event), "process_IN_DELETE", "info")
+    def process_IN_DELETE(self, event: pyinotify.ProcessEvent) -> None:
+        logger.debug(f"process_IN_DELETE: {str(event)}")
         destpath = os.path.join(
             self.DestinationDirectory,
             os.path.relpath(event.pathname, os.path.join(self.SourceDirectory, "..")),
@@ -711,10 +662,10 @@ class EventHandler(pyinotify.ProcessEvent):
             if not AutoRemove.WasFileRemovedAfterUpload(event.pathname):
                 jobs.put((AsyncFunc.Delete, destpath + ".bz2"))
             else:
-                Logger.PrettyPrint(destpath + ".bz2", "Keeping", "remote")
+                logger.info(f"Keeping remote file {destpath}.bz2")
 
-    def process_IN_MOVED_TO(self, event) -> None:
-        Logger.PrettyPrint(str(event), "process_IN_MOVED_TO", "info")
+    def process_IN_MOVED_TO(self, event: pyinotify.ProcessEvent) -> None:
+        logger.debug(f"process_IN_MOVED_TO: {str(event)}")
         # Moved from untracked directory, handle as new file
         if not hasattr(event, "src_pathname"):
             if (
@@ -773,7 +724,12 @@ class EventHandler(pyinotify.ProcessEvent):
 
 
 class DirectoryHandler:
-    def __init__(self, source, destination, watchmanager=None):
+    def __init__(
+        self,
+        source: str,
+        destination: str,
+        watchmanager: Optional[pyinotify.WatchManager] = None,
+    ):
         self.SourceDirectory = os.path.abspath(source)
         self.DestinationDirectory = destination
 
@@ -789,11 +745,17 @@ class DirectoryHandler:
                 self.SourceDirectory, NOTIFY_MASK, rec=True, auto_add=True
             )
 
-    def __enter__(self):
+    def __enter__(self) -> DirectoryHandler:
         return self
 
-    def __exit__(self, type, value, traceback) -> None:
+    def __exit__(
+        self,
+        type: Optional[Type[BaseException]],
+        value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> typing_extensions.Literal[False]:
         self.WatchManager.rm_watch(self.NotifyWatch, rec=True)
+        return False
 
     def Loop(self) -> None:
         self.NotifyNotifier.process_events()
@@ -808,7 +770,7 @@ class DirectoryHandler:
                 )
             )
 
-    def Do(self, ftp) -> None:  # Normal mode
+    def Do(self, ftp: ftplib.FTP) -> None:  # Normal mode
         for dirpath, _dirnames, filenames in os.walk(self.SourceDirectory):
             if not any(folder in dirpath for folder in config["ignore_folders"]):
 
@@ -827,7 +789,7 @@ class DirectoryHandler:
                 ]:
                     self.Checkfile(ftp, dirpath, filename)
 
-    def Checkfile(self, ftp, dirpath, filename) -> None:
+    def Checkfile(self, ftp: ftplib.FTP, dirpath: str, filename: str) -> None:
         sourcefile = os.path.join(dirpath, filename)
         destfile = os.path.join(
             self.DestinationDirectory,
@@ -839,8 +801,8 @@ class DirectoryHandler:
         )
 
         if FTPHelper.file_exists(ftp, destfile):
-            Logger.PrettyPrint(
-                os.path.relpath(sourcefile, commonprefix), "Exists", "local"
+            logger.debug(
+                f"Local file {os.path.relpath(sourcefile, commonprefix)} exists"
             )
             jobs.put(
                 (
@@ -868,7 +830,17 @@ def main() -> None:
     global commonprefix_ftp
     commonprefix_ftp = os.path.dirname(config["ftp_path"])
 
-    Logger.PrettyPrint("AutoFastDL", "Started", "info")
+    log_level = logging.INFO
+    if config["debug"]:
+        log_level = logging.DEBUG
+
+    logging.basicConfig(
+        level=log_level,
+        format='[%(asctime)s] {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+    logger.info("AutoFastDL started")
 
     global jobs
     jobs = queue.Queue()
@@ -895,10 +867,10 @@ def main() -> None:
             for handler in DirectoryHandlers:
                 handler.Loop()
     except KeyboardInterrupt:
-        Logger.PrettyPrint("Waiting for remaining jobs to complete...", "", "info")
+        logger.info("Waiting for remaining jobs to complete...")
         jobs.join()
 
-    Logger.PrettyPrint("AutoFastDL", "Exiting", "info")
+    logger.info("AutoFastDL exiting")
 
 
 if __name__ == "__main__":
