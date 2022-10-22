@@ -834,8 +834,8 @@ def main() -> None:
 
     logging.basicConfig(
         level=log_level,
-        format='[%(asctime)s] {%(pathname)s:%(lineno)d} %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S',
+        format='%(asctime)s | %(levelname)s | %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S%z',
     )
 
     logger.info("AutoFastDL started")
