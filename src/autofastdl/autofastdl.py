@@ -760,6 +760,8 @@ class DirectoryHandler:
         while self.NotifyNotifier.check_events():
             self.NotifyNotifier.read_events()
             self.NotifyNotifier.process_events()
+            jobs.join()
+            # Make sure that only one CheckAllFiles is running at all times
             jobs.put(
                 (
                     AsyncFunc.CheckAllFiles,
