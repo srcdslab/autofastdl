@@ -34,7 +34,7 @@
     "extensions" : [
         "bsp", "nav",
         "mdl", "vtx", "vvd", "phy", "ani",
-        "vtf", "vmt", "png",
+        "vtf", "vmt", "png", "raw",
         "wav", "mp3",
         "pcf",
         "ttf", "otf"
