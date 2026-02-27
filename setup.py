@@ -23,7 +23,7 @@ with open(rel("src", "autofastdl", "__init__.py")) as f:
         raise RuntimeError("Version marker not found.")
 
 
-dependencies = ["pyinotify", "python-dateutil"]
+dependencies = ["watchdog", "python-dateutil"]
 
 extra_dependencies: Dict[str, List[str]] = {}
 
@@ -58,6 +58,8 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Programming Language :: Python :: 3 :: Only",
         "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
     ],

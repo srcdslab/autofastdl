@@ -19,22 +19,15 @@ from time import sleep
 from types import TracebackType
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type
 
-import pyinotify
 from dateutil import parser
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 logger = logging.getLogger(__name__)
 
 config: Dict[str, Any]
 commonprefix_ftp: str
 jobs: queue.Queue
-
-# inotify mask
-NOTIFY_MASK = (
-    pyinotify.IN_CLOSE_WRITE
-    | pyinotify.IN_DELETE
-    | pyinotify.IN_MOVED_TO
-    | pyinotify.IN_MOVED_FROM
-)
 
 
 def random_string(length: int) -> str:
@@ -621,105 +614,116 @@ class AsyncFunc:
         )
 
 
-class EventHandler(pyinotify.ProcessEvent):
-    def my_init(self, source: str, destination: str) -> None:
+class EventHandler(FileSystemEventHandler):
+    def __init__(self, source: str, destination: str) -> None:
+        super().__init__()
         self.SourceDirectory = os.path.abspath(source)
         self.DestinationDirectory = os.path.abspath(destination)
 
-    def process_IN_CLOSE_WRITE(self, event: pyinotify.ProcessEvent) -> None:
-        logger.debug(f"process_IN_CLOSE_WRITE: {str(event)}")
+    def on_closed(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        pathname = event.src_path
+        logger.debug(f"on_closed: {pathname}")
         if (
-            not event.pathname.endswith(config["extensions"])
-            or os.path.basename(event.pathname) in config["ignore_names"]
-            or any(folder in event.pathname for folder in config["ignore_folders"])
+            not pathname.endswith(config["extensions"])
+            or os.path.basename(pathname) in config["ignore_names"]
+            or any(folder in pathname for folder in config["ignore_folders"])
         ):
             return
 
         destpath = os.path.join(
             self.DestinationDirectory,
-            os.path.relpath(event.pathname, os.path.join(self.SourceDirectory, "..")),
+            os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
         )
-        jobs.put((AsyncFunc.Compress, event.pathname, destpath + ".bz2"))
+        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2"))
+        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
 
-    def process_IN_DELETE(self, event: pyinotify.ProcessEvent) -> None:
-        logger.debug(f"process_IN_DELETE: {str(event)}")
+    def on_created(self, event) -> None:  # type: ignore[override]
+        # Handle files moved into the watched directory from an untracked location.
+        # Such moves do not generate a close event, so we handle them here.
+        if event.is_directory:
+            return
+        pathname = event.src_path
+        logger.debug(f"on_created: {pathname}")
+        if (
+            not pathname.endswith(config["extensions"])
+            or os.path.basename(pathname) in config["ignore_names"]
+            or any(folder in pathname for folder in config["ignore_folders"])
+        ):
+            return
+
         destpath = os.path.join(
             self.DestinationDirectory,
-            os.path.relpath(event.pathname, os.path.join(self.SourceDirectory, "..")),
+            os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
         )
-        if event.dir:
+        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2"))
+        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
+
+    def on_deleted(self, event) -> None:  # type: ignore[override]
+        pathname = event.src_path
+        logger.debug(f"on_deleted: {pathname}")
+        destpath = os.path.join(
+            self.DestinationDirectory,
+            os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
+        )
+        if event.is_directory:
             if os.path.exists(destpath):
                 jobs.put((AsyncFunc.Delete, destpath))
         else:
             if (
-                not event.pathname.endswith(config["extensions"])
-                or os.path.basename(event.pathname) in config["ignore_names"]
-                or any(folder in event.pathname for folder in config["ignore_folders"])
+                not pathname.endswith(config["extensions"])
+                or os.path.basename(pathname) in config["ignore_names"]
+                or any(folder in pathname for folder in config["ignore_folders"])
             ):
                 return
 
-            if not AutoRemove.WasFileRemovedAfterUpload(event.pathname):
+            if not AutoRemove.WasFileRemovedAfterUpload(pathname):
                 jobs.put((AsyncFunc.Delete, destpath + ".bz2"))
             else:
                 logger.info(f"Keeping remote file {destpath}.bz2")
+        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
 
-    def process_IN_MOVED_TO(self, event: pyinotify.ProcessEvent) -> None:
-        logger.debug(f"process_IN_MOVED_TO: {str(event)}")
-        # Moved from untracked directory, handle as new file
-        if not hasattr(event, "src_pathname"):
-            if (
-                not event.pathname.endswith(config["extensions"])
-                or os.path.basename(event.pathname) in config["ignore_names"]
-                or any(folder in event.pathname for folder in config["ignore_folders"])
-            ):
-                return
-
-            destpath = os.path.join(
-                self.DestinationDirectory,
-                os.path.relpath(
-                    event.pathname, os.path.join(self.SourceDirectory, "..")
-                ),
-            )
-            jobs.put((AsyncFunc.Compress, event.pathname, destpath + ".bz2"))
-            return
-
+    def on_moved(self, event) -> None:  # type: ignore[override]
+        logger.debug(f"on_moved: {event.src_path} -> {event.dest_path}")
         # Moved inside tracked directory, handle as rename
         sourcepath = os.path.join(
             self.DestinationDirectory,
             os.path.relpath(
-                event.src_pathname, os.path.join(self.SourceDirectory, "..")
+                event.src_path, os.path.join(self.SourceDirectory, "..")
             ),
         )
         destpath = os.path.join(
             self.DestinationDirectory,
-            os.path.relpath(event.pathname, os.path.join(self.SourceDirectory, "..")),
+            os.path.relpath(event.dest_path, os.path.join(self.SourceDirectory, "..")),
         )
 
-        if event.dir:
+        if event.is_directory:
             jobs.put((AsyncFunc.Move, sourcepath, destpath))
         else:
             if (
-                event.src_pathname.endswith(config["extensions"])
-                or os.path.basename(event.pathname) in config["ignore_names"]
-                or any(folder in event.pathname for folder in config["ignore_folders"])
+                event.src_path.endswith(config["extensions"])
+                or os.path.basename(event.dest_path) in config["ignore_names"]
+                or any(folder in event.dest_path for folder in config["ignore_folders"])
             ):
                 return
 
-            if not event.src_pathname.endswith(
+            if not event.src_path.endswith(
                 config["extensions"]
-            ) and event.pathname.endswith(config["extensions"]):
+            ) and event.dest_path.endswith(config["extensions"]):
                 # Renamed invalid_ext file to valid one -> compress
-                jobs.put((AsyncFunc.Compress, event.pathname, destpath + ".bz2"))
+                jobs.put((AsyncFunc.Compress, event.dest_path, destpath + ".bz2"))
                 return
 
-            elif event.src_pathname.endswith(
+            elif event.src_path.endswith(
                 config["extensions"]
-            ) and not event.pathname.endswith(config["extensions"]):
+            ) and not event.dest_path.endswith(config["extensions"]):
                 # Renamed valid_ext file to invalid one -> delete from destination
                 jobs.put((AsyncFunc.Delete, sourcepath + ".bz2"))
                 return
 
             jobs.put((AsyncFunc.Move, sourcepath + ".bz2", destpath + ".bz2"))
+        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
 
 
 class DirectoryHandler:
@@ -727,21 +731,18 @@ class DirectoryHandler:
         self,
         source: str,
         destination: str,
-        watchmanager: Optional[pyinotify.WatchManager] = None,
+        observer: Optional[Observer] = None,
     ):
         self.SourceDirectory = os.path.abspath(source)
         self.DestinationDirectory = destination
 
-        if watchmanager:
-            self.WatchManager = watchmanager
+        if observer:
+            self.Observer = observer
             self.NotifyHandler = EventHandler(
                 source=self.SourceDirectory, destination=self.DestinationDirectory
             )
-            self.NotifyNotifier = pyinotify.Notifier(
-                self.WatchManager, self.NotifyHandler, timeout=1000
-            )
-            self.NotifyWatch = self.WatchManager.add_watch(
-                self.SourceDirectory, NOTIFY_MASK, rec=True, auto_add=True
+            self.NotifyWatch = observer.schedule(
+                self.NotifyHandler, self.SourceDirectory, recursive=True
             )
 
     def __enter__(self) -> DirectoryHandler:
@@ -753,22 +754,7 @@ class DirectoryHandler:
         value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> None:
-        self.WatchManager.rm_watch(self.NotifyWatch, rec=True)
-
-    def Loop(self) -> None:
-        self.NotifyNotifier.process_events()
-        while self.NotifyNotifier.check_events():
-            jobs.join()
-            self.NotifyNotifier.read_events()
-            self.NotifyNotifier.process_events()
-            jobs.join()
-            jobs.put(
-                (
-                    AsyncFunc.CheckAllFiles,
-                    self.SourceDirectory,
-                    self.DestinationDirectory,
-                )
-            )
+        self.Observer.unschedule(self.NotifyWatch)
 
     def Do(self, ftp: ftplib.FTP) -> None:  # Normal mode
         for dirpath, _dirnames, filenames in os.walk(self.SourceDirectory):
@@ -846,10 +832,10 @@ def main() -> None:
     jobs = queue.Queue()
 
     # Create initial jobs
-    WatchManager = pyinotify.WatchManager()
+    observer = Observer()
     DirectoryHandlers = []
     for source in config["sources"]:
-        handler = DirectoryHandler(source, config["ftp_path"], WatchManager)
+        handler = DirectoryHandler(source, config["ftp_path"], observer)
         DirectoryHandlers.append(handler)
         handler.Do(ftp)
 
@@ -862,11 +848,13 @@ def main() -> None:
         worker_thread.start()
 
     # inotify loop
+    observer.start()
     try:
         while True:
-            for handler in DirectoryHandlers:
-                handler.Loop()
+            sleep(1)
     except KeyboardInterrupt:
+        observer.stop()
+        observer.join()
         logger.info("Waiting for remaining jobs to complete...")
         jobs.join()
 
