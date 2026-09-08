@@ -51,20 +51,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # tests/ arrives with the test-suite PR; until then lint src only,
+      # so this job does not depend on the order those branches land in.
+      - name: Resolve lint targets
+        id: targets
+        run: |
+          paths="src"
+          if [ -d tests ]; then
+            paths="$paths tests"
+          fi
+          echo "paths=$paths" >> "$GITHUB_OUTPUT"
+
       - name: Check formatting (black)
-        run: black --check --diff src tests
+        run: black --check --diff ${{ steps.targets.outputs.paths }}
 
       - name: Check import order (isort)
-        run: isort --check-only --diff src tests
+        run: isort --check-only --diff ${{ steps.targets.outputs.paths }}
 
       - name: Lint (flake8)
-        run: flake8 src tests
+        run: flake8 ${{ steps.targets.outputs.paths }}
 
       - name: Type-check (mypy)
         run: mypy
 
       - name: Test (pytest)
-        run: pytest -v
+        run: |
+          if [ -d tests ]; then
+            pytest -v
+          else
+            echo "No tests/ directory yet; skipping."
+          fi
 
   build-and-push-image:
     name: Build and publish image
