@@ -16,6 +16,10 @@ jobs:
   enableAutoMerge:
     runs-on: ubuntu-latest
     if: github.event.pull_request.user.login == 'dependabot[bot]'
+    # NOTE: `gh pr merge --auto` only waits for checks that branch protection
+    # marks as required. For this to actually gate on CI, the `quality` job
+    # from ci.yml must be added as a required status check on master --
+    # otherwise dependency bumps merge without the test suite ever running.
     steps:
       - name: Enable auto-merge for Dependabot PRs
         run: gh pr merge --auto --merge "$PR_URL"
