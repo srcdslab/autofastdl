@@ -1,0 +1,4 @@
+# Direct runtime dependencies. Regenerate requirements.txt with:
+#     pip-compile requirements.in
+watchdog>=3.0
+python-dateutil>=2.8
