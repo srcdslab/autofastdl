@@ -12,12 +12,12 @@ import random
 import shutil
 import string
 import sys
+import tempfile
 import threading
 import traceback
-from pyclbr import Function
 from time import sleep
 from types import TracebackType
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type
+from typing import Any, Dict, Generator, List, Optional, Tuple, Type
 
 from dateutil import parser
 from watchdog.events import FileSystemEventHandler
@@ -29,17 +29,24 @@ config: Dict[str, Any]
 commonprefix_ftp: str
 jobs: queue.Queue
 
+# Set by any worker that hits an unrecoverable condition. The main loop watches
+# this and terminates the process, because sys.exit() in a worker thread only
+# unwinds that thread and would silently shrink the pool.
+fatal_error = threading.Event()
+
+EXIT_FAILURE = 84
+
 
 def random_string(length: int) -> str:
     return "".join(random.choice(string.ascii_letters) for m in range(length))
 
 
-def static_var(varname: str, value: Optional[Any] = None) -> Callable:
-    def decorate(func: Function) -> Function:
-        setattr(func, varname, value)
-        return func
-
-    return decorate
+def log_prefix(source_directory: str) -> str:
+    """
+    Prefix used to render paths in logs relative to the watched source root,
+    matching how destination paths are derived (``<source>/..``).
+    """
+    return os.path.dirname(os.path.abspath(source_directory))
 
 
 class FTPHelper:
@@ -51,8 +58,11 @@ class FTPHelper:
     @staticmethod
     def GetConnection() -> ftplib.FTP:
         if not config["ftp_protocol"] == "ftp":
-            logger.error("FTP protocol not supported!")
-            sys.exit(84)
+            raise ValueError(
+                "Unsupported ftp_protocol {0!r}, expected 'ftp'".format(
+                    config["ftp_protocol"]
+                )
+            )
 
         ftp = ftplib.FTP(config["ftp_host"])
         ftp.login(config["ftp_user"], config["ftp_password"])
@@ -68,7 +78,7 @@ class FTPHelper:
         try:
             ftp.cwd(_path)
         except Exception as exp:
-            print("the current path is : ", ftp.pwd(), exp.__str__(), _path)
+            logger.warning(f"Cannot list remote directory {_path}: {exp}")
             return [], []
         else:
             ftp.retrlines("LIST", lambda x: file_list.append(x.split()))
@@ -95,35 +105,81 @@ class FTPHelper:
             ftp.cwd("..")
             path = os.path.dirname(path)
 
+    # Per-thread listing cache. Every worker owns its own FTP connection, so a
+    # cache shared across threads would let one worker answer from a listing
+    # another worker fetched for a different directory -- and this result decides
+    # whether a file is uploaded or deleted.
+    _cache = threading.local()
+
     # This is called a lot during startup.
     @staticmethod
-    @static_var("cache_path")
-    @static_var("cache_resp")
-    @static_var("cache_ftp")
     def file_exists(ftp: ftplib.FTP, path: str) -> bool:
         Exists = False
+        cache = FTPHelper._cache
         try:
             # Cache should only be valid for one ftp connection
-            if FTPHelper.file_exists.cache_ftp != ftp:
-                FTPHelper.file_exists.cache_ftp = ftp
-                FTPHelper.file_exists.cache_path = None
-                FTPHelper.file_exists.cache_resp = None
+            if getattr(cache, "ftp", None) is not ftp:
+                cache.ftp = ftp
+                cache.path = None
+                cache.resp = []
 
-            if FTPHelper.file_exists.cache_path != os.path.dirname(path):
-                FTPHelper.file_exists.cache_path = os.path.dirname(path)
-                FTPHelper.file_exists.cache_resp = []
-                ftp.dir(os.path.dirname(path), FTPHelper.file_exists.cache_resp.append)
+            directory = os.path.dirname(path)
+            if cache.path != directory:
+                resp: List[str] = []
+                ftp.dir(directory, resp.append)
+                cache.path = directory
+                cache.resp = resp
 
-            for line in FTPHelper.file_exists.cache_resp:
+            for line in cache.resp:
                 if line[0] == "-":
                     line = line.split(maxsplit=8)[8]
                     if line == os.path.basename(path):
                         Exists = True
                         break
         except ftplib.all_errors:
+            # Do not leave a half-populated listing behind for the next call.
+            cache.path = None
+            cache.resp = []
             return Exists
 
         return Exists
+
+    @staticmethod
+    def makedirs(ftp: ftplib.FTP, directory: str) -> None:
+        """
+        Create a remote directory tree, ignoring components that already exist.
+        """
+        create_tree = os.path.relpath(directory, commonprefix_ftp).split("/")
+        create_tree.reverse()
+        # First one will always be /cstrike or whatever...
+        create_dir = os.path.abspath(os.path.join(commonprefix_ftp, create_tree.pop()))
+        while create_tree:
+            create_dir = os.path.abspath(os.path.join(create_dir, create_tree.pop()))
+            try:
+                ftp.mkd(create_dir)
+            except ftplib.error_perm as e:
+                # ignore "directory already exists"
+                if not e.args[0].startswith("550"):
+                    raise
+
+    @staticmethod
+    def rmtree(ftp: ftplib.FTP, path: str) -> None:
+        """
+        Recursively remove a remote directory. ``DELE`` only works on files, so
+        the tree has to be emptied depth-first before ``RMD`` will succeed.
+        """
+        dirs, nondirs = FTPHelper.listdir(ftp, path)
+        for name in nondirs:
+            try:
+                ftp.delete(path + "/" + name)
+            except ftplib.all_errors as e:
+                logger.warning(f"Could not delete remote file {path}/{name}: {e}")
+        for name in dirs:
+            FTPHelper.rmtree(ftp, path + "/" + name)
+        try:
+            ftp.rmd(path)
+        except ftplib.all_errors as e:
+            logger.warning(f"Could not remove remote directory {path}: {e}")
 
     @staticmethod
     def dir_exists(ftp: ftplib.FTP, path: str) -> bool:
@@ -143,50 +199,72 @@ class FTPHelper:
         return Exists
 
     @staticmethod
-    def Worker() -> None:
-        ftp = FTPHelper.GetConnection()
+    def EnsureConnection(ftp: ftplib.FTP) -> ftplib.FTP:
+        """
+        Return a live connection, reconnecting if the current one is dead.
 
-        while True:
-            job = jobs.get()
+        Raises ConnectionError once the retry budget is exhausted.
+        """
+        sleep_seconds = 10
+        retry_max = 10
 
+        for retry in range(1, retry_max + 1):
             try:
-                retry = 0
-                sleep_seconds = 10
-                retry_max = 10
-                while retry < retry_max:
-                    try:
-                        ftp.voidcmd("NOOP")
-                        break
-                    except Exception as e:
-                        logger.warning("Failed sending a NOOP command ({0})".format(e))
-                        logger.info(
-                            f"Trying to reconnect in {sleep_seconds} seconds [{retry}/{retry_max}]",
-                        )
-                        sleep(sleep_seconds)
-                        try:
-                            ftp = FTPHelper.GetConnection()
-                        except Exception:
-                            pass
-
-                    retry += 1
-
-                if retry > retry_max:
-                    logger.error(
-                        "Failed too many times trying to reconnect to the FTP, exiting",
-                    )
-                    sys.exit(84)
-
-                logger.debug("Job: {0}({1})".format(job[0].__name__, job[1]))
-
-                job[0](ftp, job[1:])
-
+                ftp.voidcmd("NOOP")
+                return ftp
             except Exception as e:
-                logger.error("worker error {0}".format(e))
-                logger.error(traceback.format_exc())
+                logger.warning("Failed sending a NOOP command ({0})".format(e))
+                logger.info(
+                    f"Trying to reconnect in {sleep_seconds} seconds [{retry}/{retry_max}]",
+                )
+                sleep(sleep_seconds)
+                try:
+                    ftp = FTPHelper.GetConnection()
+                except Exception as reconnect_error:
+                    logger.warning(f"Reconnection attempt failed: {reconnect_error}")
 
-            jobs.task_done()
+        raise ConnectionError(
+            f"Could not reconnect to the FTP server after {retry_max} attempts"
+        )
 
-        ftp.quit()
+    @staticmethod
+    def Worker() -> None:
+        try:
+            ftp = FTPHelper.GetConnection()
+        except Exception as e:
+            logger.error(f"Worker could not establish an FTP connection: {e}")
+            fatal_error.set()
+            return
+
+        try:
+            while not fatal_error.is_set():
+                try:
+                    job = jobs.get(timeout=1)
+                except queue.Empty:
+                    continue
+
+                try:
+                    ftp = FTPHelper.EnsureConnection(ftp)
+
+                    logger.debug("Job: {0}({1})".format(job[0].__name__, job[1]))
+
+                    job[0](ftp, job[1:])
+
+                except ConnectionError as e:
+                    # Unrecoverable: stop the whole process rather than quietly
+                    # losing a worker and stalling the queue.
+                    logger.error(f"{e}, exiting")
+                    fatal_error.set()
+                except Exception as e:
+                    logger.error("worker error {0}".format(e))
+                    logger.error(traceback.format_exc())
+                finally:
+                    jobs.task_done()
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
 
 
 class AutoRemove:
@@ -249,11 +327,7 @@ class AutoRemove:
                             os.path.relpath(dirpath, os.path.join(sourcedir, "..")),
                             filename + ".bz2",
                         )
-                        commonprefix = os.path.abspath(
-                            os.path.join(
-                                os.path.dirname(os.path.commonprefix(sourcefile)), ".."
-                            )
-                        )
+                        commonprefix = log_prefix(sourcedir)
 
                         if FTPHelper.file_exists(ftp, destfile):
                             jobs.put(
@@ -343,13 +417,20 @@ class AutoRemove:
 
     @staticmethod
     def GetTimestampFTP(ftp: ftplib.FTP, myfile: str) -> datetime.datetime:
+        # MDTM is specified to return UTC, but yields a naive datetime. Tag it so
+        # it is never compared against a local-time value.
         timestamp = ftp.sendcmd("MDTM " + myfile)[4:].strip()
-        return parser.parse(timestamp)
+        parsed = parser.parse(timestamp)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed
 
     @staticmethod
     def GetTimestampFile(myfile: str) -> datetime.datetime:
         fname = pathlib.Path(myfile)
-        return datetime.datetime.fromtimestamp(fname.stat().st_mtime)
+        return datetime.datetime.fromtimestamp(
+            fname.stat().st_mtime, tz=datetime.timezone.utc
+        )
 
     @staticmethod
     def CheckFileFTP(
@@ -421,7 +502,10 @@ class AutoRemove:
                     seconds=config[AutoRemove.configName][method]["seconds"]
                 )
 
-            currenttime = datetime.datetime.now()
+            currenttime = datetime.datetime.now(datetime.timezone.utc)
+
+            if mydatetime.tzinfo is None:
+                mydatetime = mydatetime.replace(tzinfo=datetime.timezone.utc)
 
             if (
                 checkTimeDelta != datetime.timedelta(minutes=0)
@@ -429,10 +513,6 @@ class AutoRemove:
             ):
                 return True
         return False
-
-    @staticmethod
-    def IsConfigGood() -> bool:
-        return AutoRemove.configName in config
 
     @staticmethod
     def IsFileRemoved(method: str) -> bool:
@@ -467,15 +547,6 @@ class AutoRemove:
             and method in config[AutoRemove.configName]
             and "autoclean" in config[AutoRemove.configName][method]
             and config[AutoRemove.configName][method]["autoclean"]
-        )
-
-    @staticmethod
-    def GetTimezone(method: str, name: str) -> bool:
-        return (
-            AutoRemove.configName in config
-            and method in config[AutoRemove.configName]
-            and name in config[AutoRemove.configName][method]
-            and config[AutoRemove.configName][method][name]
         )
 
 
@@ -515,7 +586,7 @@ class AsyncFunc:
             logger.info(
                 f"Local file {os.path.relpath(sourcefile, commonprefix)} added to queue"
             )
-            jobs.put((AsyncFunc.Compress, sourcefile, destfile))
+            jobs.put((AsyncFunc.Compress, sourcefile, destfile, commonprefix))
 
     @staticmethod
     def CheckAllFiles(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
@@ -524,74 +595,65 @@ class AsyncFunc:
         AutoRemove.CheckAllFiles(ftp, sourcedir, destdir)
 
     @staticmethod
-    def Compress(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
-        sourcefile, destfile = item
-        # Remove destination file if already exists
-        if FTPHelper.file_exists(ftp, destfile):
-            ftp.delete(destfile)
+    def Compress(ftp: ftplib.FTP, item: Tuple[str, str, str]) -> None:
+        sourcefile, destfile, commonprefix = item
+        relative_source = os.path.relpath(sourcefile, commonprefix)
 
         # Check whether directory tree exists at destination, create it if necessary
         directory = os.path.dirname(destfile)
         if not FTPHelper.dir_exists(ftp, directory):
-            create_tree = os.path.relpath(directory, commonprefix_ftp).split("/")
-            create_tree.reverse()
-            # First one will always be /cstrike or whatever...
-            create_dir = os.path.abspath(
-                os.path.join(commonprefix_ftp, create_tree.pop())
-            )
-            while create_tree:
-                create_dir = os.path.abspath(
-                    os.path.join(create_dir, create_tree.pop())
+            FTPHelper.makedirs(ftp, directory)
+
+        # Upload under a temporary name and rename into place, so that an
+        # interrupted transfer can never leave a truncated archive that clients
+        # would download, and so a failure keeps the previous file intact.
+        uploadfile = destfile + ".part-" + random_string(8)
+
+        with tempfile.TemporaryDirectory(prefix="fastDL_sync_") as folder:
+            localtemp = os.path.join(folder, os.path.basename(destfile))
+
+            with open(sourcefile, "rb") as infile:
+                with bz2.BZ2File(localtemp, "wb", compresslevel=9) as outfile:
+                    shutil.copyfileobj(infile, outfile, 64 * 1024)
+
+            try:
+                with open(localtemp, "rb") as temp:
+                    ftp.storbinary("STOR {0}".format(uploadfile), temp)
+
+                # Replace the previous archive only now that the new one is
+                # fully transferred.
+                if FTPHelper.file_exists(ftp, destfile):
+                    ftp.delete(destfile)
+                ftp.rename(uploadfile, destfile)
+
+                logger.info(f"Local file {relative_source} uploaded to remote")
+                AutoRemove.HandleFileUploaded(sourcefile, commonprefix)
+            except Exception:
+                logger.error(f"Unexpected error:\n{str(sys.exc_info())}")
+                logger.warning(
+                    f"Local file {relative_source} failed to upload to remote (Skipping)"
                 )
                 try:
-                    ftp.mkd(create_dir)
-                except ftplib.error_perm as e:
-                    # ignore "directory already exists"
-                    if not e.args[0].startswith("550"):
-                        raise
-
-        folder = "/tmp/fastDL_sync_" + random_string(10)
-
-        os.mkdir(folder)
-
-        tempfile = os.path.join(folder, os.path.basename(destfile))
-
-        with open(sourcefile, "rb") as infile:
-            with bz2.BZ2File(tempfile, "wb", compresslevel=9) as outfile:
-                shutil.copyfileobj(infile, outfile, 64 * 1024)
-
-        commonprefix = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.commonprefix(sourcefile)), "..")
-        )
-
-        try:
-            with open(tempfile, "rb") as temp:
-                ftp.storbinary("STOR {0}".format(destfile), temp)
-
-            logger.info(
-                f"Local file {os.path.relpath(sourcefile, commonprefix)} uploaded to remote"
-            )
-            AutoRemove.HandleFileUploaded(sourcefile, commonprefix)
-        except Exception:
-            logger.error(f"Unexpected error:\n{str(sys.exc_info())}")
-            logger.warn(
-                f"Local file {os.path.relpath(sourcefile, commonprefix)} failed to upload to remote (Skipping)"
-            )
-
-        os.remove(tempfile)
-
-        os.rmdir(folder)
+                    ftp.delete(uploadfile)
+                except ftplib.all_errors:
+                    pass
 
     @staticmethod
-    def Delete(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
+    def Delete(ftp: ftplib.FTP, item: Tuple[str, bool]) -> None:
         path = item[0]
+        is_directory = bool(item[1]) if len(item) > 1 else False
 
         try:
-            ftp.delete(path)
-
-            logger.info(
-                f"Remote file {os.path.relpath(path, commonprefix_ftp)} deleted"
-            )
+            if is_directory:
+                FTPHelper.rmtree(ftp, path)
+                logger.info(
+                    f"Remote directory {os.path.relpath(path, commonprefix_ftp)} deleted"
+                )
+            else:
+                ftp.delete(path)
+                logger.info(
+                    f"Remote file {os.path.relpath(path, commonprefix_ftp)} deleted"
+                )
         except ftplib.error_perm:
             pass
 
@@ -602,7 +664,7 @@ class AsyncFunc:
         # Check whether directory tree exists at destination, create it if necessary
         directory = os.path.dirname(destpath)
         if not FTPHelper.dir_exists(ftp, directory):
-            ftp.mkd(directory)
+            FTPHelper.makedirs(ftp, directory)
 
         ftp.rename(sourcepath, destpath)
 
@@ -619,6 +681,7 @@ class EventHandler(FileSystemEventHandler):
         super().__init__()
         self.SourceDirectory = os.path.abspath(source)
         self.DestinationDirectory = os.path.abspath(destination)
+        self.LogPrefix = log_prefix(self.SourceDirectory)
 
     def on_closed(self, event) -> None:  # type: ignore[override]
         if event.is_directory:
@@ -636,8 +699,10 @@ class EventHandler(FileSystemEventHandler):
             self.DestinationDirectory,
             os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
         )
-        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2"))
-        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
+        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2", self.LogPrefix))
+        jobs.put(
+            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
+        )
 
     def on_created(self, event) -> None:  # type: ignore[override]
         # Handle files moved into the watched directory from an untracked location.
@@ -657,8 +722,10 @@ class EventHandler(FileSystemEventHandler):
             self.DestinationDirectory,
             os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
         )
-        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2"))
-        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
+        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2", self.LogPrefix))
+        jobs.put(
+            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
+        )
 
     def on_deleted(self, event) -> None:  # type: ignore[override]
         pathname = event.src_path
@@ -668,8 +735,9 @@ class EventHandler(FileSystemEventHandler):
             os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
         )
         if event.is_directory:
-            if os.path.exists(destpath):
-                jobs.put((AsyncFunc.Delete, destpath))
+            # destpath lives on the FTP server; whether it exists is decided by
+            # the worker holding the connection, not by the local filesystem.
+            jobs.put((AsyncFunc.Delete, destpath, True))
         else:
             if (
                 not pathname.endswith(config["extensions"])
@@ -679,19 +747,19 @@ class EventHandler(FileSystemEventHandler):
                 return
 
             if not AutoRemove.WasFileRemovedAfterUpload(pathname):
-                jobs.put((AsyncFunc.Delete, destpath + ".bz2"))
+                jobs.put((AsyncFunc.Delete, destpath + ".bz2", False))
             else:
                 logger.info(f"Keeping remote file {destpath}.bz2")
-        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
+        jobs.put(
+            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
+        )
 
     def on_moved(self, event) -> None:  # type: ignore[override]
         logger.debug(f"on_moved: {event.src_path} -> {event.dest_path}")
         # Moved inside tracked directory, handle as rename
         sourcepath = os.path.join(
             self.DestinationDirectory,
-            os.path.relpath(
-                event.src_path, os.path.join(self.SourceDirectory, "..")
-            ),
+            os.path.relpath(event.src_path, os.path.join(self.SourceDirectory, "..")),
         )
         destpath = os.path.join(
             self.DestinationDirectory,
@@ -701,29 +769,40 @@ class EventHandler(FileSystemEventHandler):
         if event.is_directory:
             jobs.put((AsyncFunc.Move, sourcepath, destpath))
         else:
+            source_tracked = event.src_path.endswith(config["extensions"])
+            dest_tracked = event.dest_path.endswith(config["extensions"])
+
+            # Nothing to mirror if neither side is a tracked asset, or if the
+            # destination is excluded by configuration.
             if (
-                event.src_path.endswith(config["extensions"])
+                not source_tracked
+                and not dest_tracked
                 or os.path.basename(event.dest_path) in config["ignore_names"]
                 or any(folder in event.dest_path for folder in config["ignore_folders"])
             ):
                 return
 
-            if not event.src_path.endswith(
-                config["extensions"]
-            ) and event.dest_path.endswith(config["extensions"]):
+            if not source_tracked and dest_tracked:
                 # Renamed invalid_ext file to valid one -> compress
-                jobs.put((AsyncFunc.Compress, event.dest_path, destpath + ".bz2"))
+                jobs.put(
+                    (
+                        AsyncFunc.Compress,
+                        event.dest_path,
+                        destpath + ".bz2",
+                        self.LogPrefix,
+                    )
+                )
                 return
 
-            elif event.src_path.endswith(
-                config["extensions"]
-            ) and not event.dest_path.endswith(config["extensions"]):
+            elif source_tracked and not dest_tracked:
                 # Renamed valid_ext file to invalid one -> delete from destination
-                jobs.put((AsyncFunc.Delete, sourcepath + ".bz2"))
+                jobs.put((AsyncFunc.Delete, sourcepath + ".bz2", False))
                 return
 
             jobs.put((AsyncFunc.Move, sourcepath + ".bz2", destpath + ".bz2"))
-        jobs.put((AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory))
+        jobs.put(
+            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
+        )
 
 
 class DirectoryHandler:
@@ -782,9 +861,7 @@ class DirectoryHandler:
             os.path.relpath(dirpath, os.path.join(self.SourceDirectory, "..")),
             filename + ".bz2",
         )
-        commonprefix = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.commonprefix(sourcefile)), "..")
-        )
+        commonprefix = log_prefix(self.SourceDirectory)
 
         if FTPHelper.file_exists(ftp, destfile):
             logger.debug(
@@ -810,23 +887,29 @@ def main() -> None:
 
     config["extensions"] = tuple(config["extensions"])
 
-    ftp = FTPHelper.GetConnection()
-
-    # make common prefix for better logging
-    global commonprefix_ftp
-    commonprefix_ftp = os.path.dirname(config["ftp_path"])
-
+    # Configure logging before anything that can fail, so startup errors are
+    # emitted through the configured handler instead of the fallback one.
     log_level = logging.INFO
     if config["debug"]:
         log_level = logging.DEBUG
 
     logging.basicConfig(
         level=log_level,
-        format='%(asctime)s | %(levelname)s | %(message)s',
-        datefmt='%Y-%m-%dT%H:%M:%S%z',
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
 
     logger.info("AutoFastDL started")
+
+    try:
+        ftp = FTPHelper.GetConnection()
+    except Exception as e:
+        logger.error(f"Could not connect to the FTP server: {e}")
+        sys.exit(EXIT_FAILURE)
+
+    # make common prefix for better logging
+    global commonprefix_ftp
+    commonprefix_ftp = os.path.dirname(config["ftp_path"])
 
     global jobs
     jobs = queue.Queue()
@@ -847,16 +930,26 @@ def main() -> None:
         worker_thread.daemon = True
         worker_thread.start()
 
-    # inotify loop
+    # filesystem event loop
     observer.start()
+    interrupted = False
     try:
-        while True:
-            sleep(1)
+        # fatal_error is set by a worker that exhausted its FTP retry budget.
+        while not fatal_error.wait(timeout=1):
+            pass
     except KeyboardInterrupt:
-        observer.stop()
-        observer.join()
+        interrupted = True
+
+    observer.stop()
+    observer.join()
+
+    if interrupted:
         logger.info("Waiting for remaining jobs to complete...")
         jobs.join()
+
+    if fatal_error.is_set():
+        logger.error("AutoFastDL exiting after an unrecoverable error")
+        sys.exit(EXIT_FAILURE)
 
     logger.info("AutoFastDL exiting")
 
