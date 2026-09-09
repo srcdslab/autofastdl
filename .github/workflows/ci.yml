@@ -32,9 +32,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # watchdog 6.x requires >= 3.9, so 3.8 is not installable here even
-        # though setup.py still advertises it.
-        python-version: ['3.9', '3.11', '3.12']
+        # black/flake8/isort have all dropped 3.9, and mypy refuses a
+        # python_version below 3.10, so 3.10 is the floor we can actually test.
+        python-version: ['3.10', '3.11', '3.12']
 
     steps:
       - name: Checkout repository

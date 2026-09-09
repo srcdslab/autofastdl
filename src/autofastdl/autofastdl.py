@@ -20,8 +20,9 @@ from types import TracebackType
 from typing import Any, Dict, Generator, List, Optional, Tuple, Type
 
 from dateutil import parser
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.observers.api import BaseObserver
 
 logger = logging.getLogger(__name__)
 
@@ -683,10 +684,10 @@ class EventHandler(FileSystemEventHandler):
         self.DestinationDirectory = os.path.abspath(destination)
         self.LogPrefix = log_prefix(self.SourceDirectory)
 
-    def on_closed(self, event) -> None:  # type: ignore[override]
+    def on_closed(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
-        pathname = event.src_path
+        pathname = os.fsdecode(event.src_path)
         logger.debug(f"on_closed: {pathname}")
         if (
             not pathname.endswith(config["extensions"])
@@ -704,12 +705,12 @@ class EventHandler(FileSystemEventHandler):
             (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
         )
 
-    def on_created(self, event) -> None:  # type: ignore[override]
+    def on_created(self, event: FileSystemEvent) -> None:
         # Handle files moved into the watched directory from an untracked location.
         # Such moves do not generate a close event, so we handle them here.
         if event.is_directory:
             return
-        pathname = event.src_path
+        pathname = os.fsdecode(event.src_path)
         logger.debug(f"on_created: {pathname}")
         if (
             not pathname.endswith(config["extensions"])
@@ -727,8 +728,8 @@ class EventHandler(FileSystemEventHandler):
             (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
         )
 
-    def on_deleted(self, event) -> None:  # type: ignore[override]
-        pathname = event.src_path
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        pathname = os.fsdecode(event.src_path)
         logger.debug(f"on_deleted: {pathname}")
         destpath = os.path.join(
             self.DestinationDirectory,
@@ -754,31 +755,33 @@ class EventHandler(FileSystemEventHandler):
             (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
         )
 
-    def on_moved(self, event) -> None:  # type: ignore[override]
-        logger.debug(f"on_moved: {event.src_path} -> {event.dest_path}")
+    def on_moved(self, event: FileSystemEvent) -> None:
+        src_path = os.fsdecode(event.src_path)
+        dest_path = os.fsdecode(event.dest_path)
+        logger.debug(f"on_moved: {src_path} -> {dest_path}")
         # Moved inside tracked directory, handle as rename
         sourcepath = os.path.join(
             self.DestinationDirectory,
-            os.path.relpath(event.src_path, os.path.join(self.SourceDirectory, "..")),
+            os.path.relpath(src_path, os.path.join(self.SourceDirectory, "..")),
         )
         destpath = os.path.join(
             self.DestinationDirectory,
-            os.path.relpath(event.dest_path, os.path.join(self.SourceDirectory, "..")),
+            os.path.relpath(dest_path, os.path.join(self.SourceDirectory, "..")),
         )
 
         if event.is_directory:
             jobs.put((AsyncFunc.Move, sourcepath, destpath))
         else:
-            source_tracked = event.src_path.endswith(config["extensions"])
-            dest_tracked = event.dest_path.endswith(config["extensions"])
+            source_tracked = src_path.endswith(config["extensions"])
+            dest_tracked = dest_path.endswith(config["extensions"])
 
             # Nothing to mirror if neither side is a tracked asset, or if the
             # destination is excluded by configuration.
             if (
                 not source_tracked
                 and not dest_tracked
-                or os.path.basename(event.dest_path) in config["ignore_names"]
-                or any(folder in event.dest_path for folder in config["ignore_folders"])
+                or os.path.basename(dest_path) in config["ignore_names"]
+                or any(folder in dest_path for folder in config["ignore_folders"])
             ):
                 return
 
@@ -787,7 +790,7 @@ class EventHandler(FileSystemEventHandler):
                 jobs.put(
                     (
                         AsyncFunc.Compress,
-                        event.dest_path,
+                        dest_path,
                         destpath + ".bz2",
                         self.LogPrefix,
                     )
@@ -810,7 +813,7 @@ class DirectoryHandler:
         self,
         source: str,
         destination: str,
-        observer: Optional[Observer] = None,
+        observer: Optional[BaseObserver] = None,
     ):
         self.SourceDirectory = os.path.abspath(source)
         self.DestinationDirectory = destination
