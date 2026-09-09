@@ -3,7 +3,6 @@ from __future__ import annotations
 import bz2
 import datetime
 import ftplib
-import json
 import logging
 import os
 import pathlib
@@ -23,6 +22,9 @@ from dateutil import parser
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
+
+from autofastdl import config as configuration
+from autofastdl.config import split_path
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,20 @@ DEFAULT_CREATED_GRACE = 5
 # Depth beyond which new event-driven work is dropped; the reconciler will
 # pick it up on its next pass.
 DEFAULT_QUEUE_HIGH_WATER = 10000
+
+
+def path_is_ignored(pathname: str) -> bool:
+    """
+    True when any component of the path is an ignored folder.
+
+    Matching used to be an unanchored substring test, so an "workshop" rule
+    also excluded "workshop_backup" and any path merely containing the word.
+    """
+    ignore_folders = config["ignore_folders"]
+    if not ignore_folders:
+        return False
+    parts = set(split_path(pathname))
+    return any(folder in parts for folder in ignore_folders)
 
 
 def config_int(name: str, default: int) -> int:
@@ -149,10 +165,21 @@ class FTPHelper:
 
     @staticmethod
     def GetConnection() -> ftplib.FTP:
-        if not config["ftp_protocol"] == "ftp":
+        protocol = config["ftp_protocol"]
+
+        if protocol == "ftps":
+            # Explicit TLS: AUTH TLS on the control channel, then PROT P so the
+            # data channel is encrypted too. Without prot_p() the credentials
+            # would be protected but the file transfers would not.
+            ftps = ftplib.FTP_TLS(config["ftp_host"])
+            ftps.login(config["ftp_user"], config["ftp_password"])
+            ftps.prot_p()
+            return ftps
+
+        if protocol != "ftp":
             raise ValueError(
-                "Unsupported ftp_protocol {0!r}, expected 'ftp'".format(
-                    config["ftp_protocol"]
+                "Unsupported ftp_protocol {0!r}, expected one of: ftp, ftps".format(
+                    protocol
                 )
             )
 
@@ -396,7 +423,7 @@ class AutoRemove:
             return
 
         for dirpath, _dirnames, filenames in os.walk(sourcedir):
-            if not any(folder in dirpath for folder in config["ignore_folders"]):
+            if not path_is_ignored(dirpath):
 
                 if AutoRemove.IsAutoCleaned(AutoRemove.configFTP):
                     destdirectory = os.path.join(
@@ -471,7 +498,7 @@ class AutoRemove:
             ftp_ignore_names.append(f"{ign_name}.bz2")
 
         for dirpath, _dirnames, filenames in FTPHelper.walk(ftp, sourcedir):
-            if not any(folder in dirpath for folder in config["ignore_folders"]):
+            if not path_is_ignored(dirpath):
                 filenames.sort()
                 for filename in [
                     f
@@ -795,7 +822,7 @@ class EventHandler(FileSystemEventHandler):
         return (
             pathname.endswith(config["extensions"])
             and os.path.basename(pathname) not in config["ignore_names"]
-            and not any(folder in pathname for folder in config["ignore_folders"])
+            and not path_is_ignored(pathname)
         )
 
     def RemotePath(self, pathname: str) -> str:
@@ -914,7 +941,7 @@ class EventHandler(FileSystemEventHandler):
                 not source_tracked
                 and not dest_tracked
                 or os.path.basename(dest_path) in config["ignore_names"]
-                or any(folder in dest_path for folder in config["ignore_folders"])
+                or path_is_ignored(dest_path)
             ):
                 return
 
@@ -971,7 +998,7 @@ class DirectoryHandler:
 
     def Do(self, ftp: ftplib.FTP) -> None:  # Normal mode
         for dirpath, _dirnames, filenames in os.walk(self.SourceDirectory):
-            if not any(folder in dirpath for folder in config["ignore_folders"]):
+            if not path_is_ignored(dirpath):
 
                 destdirectory = os.path.join(
                     self.DestinationDirectory,
@@ -1014,26 +1041,55 @@ class DirectoryHandler:
             jobs.put((AsyncFunc.CheckFileAdd, sourcefile, commonprefix, destfile))
 
 
-def main() -> None:
-    global config
-    with open("config.json", "r") as jsonfile:
-        config = json.load(jsonfile)
+def setup_logging(debug: bool, docker: bool) -> None:
+    """
+    Configure the root logger.
 
-    config["extensions"] = tuple(config["extensions"])
-
-    # Configure logging before anything that can fail, so startup errors are
-    # emitted through the configured handler instead of the fallback one.
-    log_level = logging.INFO
-    if config["debug"]:
-        log_level = logging.DEBUG
+    Under `docker`, timestamps are omitted: the container runtime already
+    stamps every line it collects, so emitting our own duplicates them in
+    `docker logs` and in anything downstream of it.
+    """
+    if docker:
+        logging.basicConfig(
+            level=logging.DEBUG if debug else logging.INFO,
+            format="%(levelname)s | %(message)s",
+            stream=sys.stdout,
+        )
+        return
 
     logging.basicConfig(
-        level=log_level,
+        level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
 
+
+def main() -> None:
+    global config
+
+    try:
+        path = configuration.config_path(sys.argv[1:])
+        config = configuration.load(path)
+    except configuration.ConfigError as e:
+        # Logging is not configured yet, and the message must not be swallowed.
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(EXIT_FAILURE)
+
+    # Configure logging before anything that can fail, so startup errors are
+    # emitted through the configured handler instead of the fallback one.
+    setup_logging(config["debug"], config["docker"])
+
     logger.info("AutoFastDL started")
+    logger.debug(f"Configuration loaded from {path}")
+
+    for source in configuration.missing_sources(config):
+        logger.warning(f"Source directory does not exist yet: {source}")
+
+    if config["ftp_protocol"] == "ftp":
+        logger.warning(
+            "Using plaintext FTP: credentials and file contents are sent "
+            "unencrypted. Set ftp_protocol to 'ftps' if the server supports it."
+        )
 
     try:
         ftp = FTPHelper.GetConnection()
