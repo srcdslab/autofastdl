@@ -6,7 +6,7 @@
 #
 colorama==0.4.5
     # via autofastdl (setup.py)
-python-dateutil==2.8.2
+python-dateutil==2.9.0.post0
     # via autofastdl (setup.py)
 pytz==2022.4
     # via autofastdl (setup.py)
