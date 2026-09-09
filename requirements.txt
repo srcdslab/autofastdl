@@ -4,7 +4,7 @@
 #
 #    pip-compile
 #
-colorama==0.4.5
+colorama==0.4.6
     # via autofastdl (setup.py)
 python-dateutil==2.9.0.post0
     # via autofastdl (setup.py)
