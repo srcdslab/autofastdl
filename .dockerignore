@@ -8,3 +8,7 @@ venv
 .*
 Dockerfile
 build
+
+# A developer's real config carries live FTP credentials; never bake it in.
+config.json
+tests
