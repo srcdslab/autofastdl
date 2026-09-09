@@ -23,7 +23,7 @@ with open(rel("src", "autofastdl", "__init__.py")) as f:
         raise RuntimeError("Version marker not found.")
 
 
-dependencies = ["watchdog", "python-dateutil"]
+dependencies = ["watchdog>=3.0", "python-dateutil>=2.8"]
 
 extra_dependencies: Dict[str, List[str]] = {}
 
@@ -44,22 +44,29 @@ setup(
     version=version,
     author="maxime1907",
     author_email="noreply@nide.gg",
+    maintainer="srcdslab",
     description="Automates the fastdl process for steam source engine games",
     long_description=long_description,
     long_description_content_type="text/markdown",
+    url="https://github.com/srcdslab/autofastdl",
+    project_urls={
+        "Source": "https://github.com/srcdslab/autofastdl",
+        "Issues": "https://github.com/srcdslab/autofastdl/issues",
+    },
+    license="LGPLv3+",
     packages=find_packages("src", exclude=["*.tests", "*.tests.*", "tests.*", "tests"]),
     package_dir={"": "src"},
     include_package_data=True,
     zip_safe=True,
-    python_requires=">=3.8",
+    python_requires=">=3.9",
     install_requires=dependencies,
     extras_require=extra_dependencies,
     classifiers=[
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Programming Language :: Python :: 3 :: Only",
         "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
     ],
