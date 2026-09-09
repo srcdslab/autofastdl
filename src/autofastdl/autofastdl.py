@@ -3,7 +3,6 @@ from __future__ import annotations
 import bz2
 import datetime
 import ftplib
-import json
 import logging
 import os
 import pathlib
@@ -15,7 +14,7 @@ import sys
 import tempfile
 import threading
 import traceback
-from time import sleep
+from time import monotonic, sleep
 from types import TracebackType
 from typing import Any, Dict, Generator, List, Optional, Tuple, Type
 
@@ -23,6 +22,9 @@ from dateutil import parser
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import BaseObserver
+
+from autofastdl import config as configuration
+from autofastdl.config import split_path
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,111 @@ def log_prefix(source_directory: str) -> str:
     return os.path.dirname(os.path.abspath(source_directory))
 
 
+# Seconds of filesystem quiet before a full reconciliation pass is queued.
+DEFAULT_RECONCILE_DEBOUNCE = 30
+# Grace period before a created-but-never-closed file is treated as complete.
+DEFAULT_CREATED_GRACE = 5
+# Depth beyond which new event-driven work is dropped; the reconciler will
+# pick it up on its next pass.
+DEFAULT_QUEUE_HIGH_WATER = 10000
+
+
+def path_is_ignored(pathname: str) -> bool:
+    """
+    True when any component of the path is an ignored folder.
+
+    Matching used to be an unanchored substring test, so an "workshop" rule
+    also excluded "workshop_backup" and any path merely containing the word.
+    """
+    ignore_folders = config["ignore_folders"]
+    if not ignore_folders:
+        return False
+    parts = set(split_path(pathname))
+    return any(folder in parts for folder in ignore_folders)
+
+
+def config_int(name: str, default: int) -> int:
+    value = config.get(name, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid {name}={value!r}, falling back to {default}")
+        return default
+
+
+def queue_has_headroom() -> bool:
+    """
+    Backpressure for the watchdog thread.
+
+    The queue is intentionally unbounded: ``CheckAllFiles`` runs *inside* a
+    worker and enqueues further jobs, so a hard ``maxsize`` would deadlock the
+    pool as soon as every worker blocked on put(). Instead the producing side
+    stops adding work past a high-water mark. Dropping an event is safe because
+    reconciliation re-derives the same work from the filesystem afterwards.
+    """
+    high_water = config_int("queue_high_water", DEFAULT_QUEUE_HIGH_WATER)
+    if jobs.qsize() < high_water:
+        return True
+    logger.warning(
+        f"Job queue above high-water mark ({high_water}), deferring event to "
+        "the next reconciliation pass"
+    )
+    return False
+
+
+class Reconciler:
+    """
+    Coalesces full-tree reconciliation passes.
+
+    Previously every filesystem event enqueued a ``CheckAllFiles`` job, each of
+    which walks the whole source tree and enqueues further work -- so copying
+    N files triggered N full walks. Requests are now debounced: a burst of
+    events results in a single pass once the filesystem goes quiet.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: Dict[Tuple[str, str], float] = {}
+        self._wakeup = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def schedule(self, source: str, destination: str) -> None:
+        with self._lock:
+            self._pending[(source, destination)] = monotonic()
+        self._wakeup.set()
+
+    def _due(self, debounce: float) -> List[Tuple[str, str]]:
+        now = monotonic()
+        with self._lock:
+            due = [key for key, last in self._pending.items() if now - last >= debounce]
+            for key in due:
+                del self._pending[key]
+            return due
+
+    def _run(self) -> None:
+        while not fatal_error.is_set():
+            debounce = config_int(
+                "reconcile_debounce_seconds", DEFAULT_RECONCILE_DEBOUNCE
+            )
+            self._wakeup.wait(timeout=1)
+            self._wakeup.clear()
+
+            for source, destination in self._due(debounce):
+                # Preserve the ordering intent of fd66aba: let queued work
+                # settle before walking the tree again, so reconciliation sees
+                # the results of the uploads it triggered.
+                jobs.join()
+                logger.debug(f"Reconciliation pass queued for {source}")
+                jobs.put((AsyncFunc.CheckAllFiles, source, destination))
+
+
+reconciler: Reconciler
+
+
 class FTPHelper:
     """
     This class is contain corresponding functions for traversing the FTP
@@ -58,10 +165,21 @@ class FTPHelper:
 
     @staticmethod
     def GetConnection() -> ftplib.FTP:
-        if not config["ftp_protocol"] == "ftp":
+        protocol = config["ftp_protocol"]
+
+        if protocol == "ftps":
+            # Explicit TLS: AUTH TLS on the control channel, then PROT P so the
+            # data channel is encrypted too. Without prot_p() the credentials
+            # would be protected but the file transfers would not.
+            ftps = ftplib.FTP_TLS(config["ftp_host"])
+            ftps.login(config["ftp_user"], config["ftp_password"])
+            ftps.prot_p()
+            return ftps
+
+        if protocol != "ftp":
             raise ValueError(
-                "Unsupported ftp_protocol {0!r}, expected 'ftp'".format(
-                    config["ftp_protocol"]
+                "Unsupported ftp_protocol {0!r}, expected one of: ftp, ftps".format(
+                    protocol
                 )
             )
 
@@ -305,13 +423,13 @@ class AutoRemove:
             return
 
         for dirpath, _dirnames, filenames in os.walk(sourcedir):
-            if not any(folder in dirpath for folder in config["ignore_folders"]):
+            if not path_is_ignored(dirpath):
 
                 if AutoRemove.IsAutoCleaned(AutoRemove.configFTP):
                     destdirectory = os.path.join(
                         destdir, os.path.relpath(dirpath, os.path.join(sourcedir, ".."))
                     )
-                    jobs.put((AsyncFunc.CheckDirFTP, destdirectory))
+                    jobs.put((AsyncFunc.CheckDirFTP, destdirectory, "autoclean"))
 
                 if AutoRemove.IsAutoCleaned(AutoRemove.configLocal):
                     logger.info(f"Local auto cleanup in {sourcedir} started")
@@ -352,8 +470,21 @@ class AutoRemove:
                     logger.info(f"Local auto cleanup in {sourcedir} done")
 
     @staticmethod
-    def CheckDirFTP(ftp: ftplib.FTP, sourcedir: str, threaded: bool = False) -> None:
-        if not AutoRemove.IsStartupClean(AutoRemove.configFTP):
+    def CheckDirFTP(
+        ftp: ftplib.FTP,
+        sourcedir: str,
+        threaded: bool = False,
+        trigger: str = "startup_clean",
+    ) -> None:
+        # A remote pass runs at startup under `startup_clean`, and during
+        # reconciliation under `autoclean`. Gating both on `startup_clean` made
+        # `autoclean: true` alone silently do nothing.
+        if trigger == "autoclean":
+            enabled = AutoRemove.IsAutoCleaned(AutoRemove.configFTP)
+        else:
+            enabled = AutoRemove.IsStartupClean(AutoRemove.configFTP)
+
+        if not enabled:
             return
 
         logger.info(f"Remote cleanup in {sourcedir} started")
@@ -367,7 +498,7 @@ class AutoRemove:
             ftp_ignore_names.append(f"{ign_name}.bz2")
 
         for dirpath, _dirnames, filenames in FTPHelper.walk(ftp, sourcedir):
-            if not any(folder in dirpath for folder in config["ignore_folders"]):
+            if not path_is_ignored(dirpath):
                 filenames.sort()
                 for filename in [
                     f
@@ -577,8 +708,9 @@ class AsyncFunc:
     @staticmethod
     def CheckDirFTP(ftp: ftplib.FTP, item: Tuple[str, str]) -> None:
         sourcedir = item[0]
+        trigger = item[1] if len(item) > 1 else "startup_clean"
 
-        AutoRemove.CheckDirFTP(ftp, sourcedir, True)
+        AutoRemove.CheckDirFTP(ftp, sourcedir, True, trigger)
 
     @staticmethod
     def CheckFileAdd(ftp: ftplib.FTP, item: Tuple[str, str, str]) -> None:
@@ -683,27 +815,60 @@ class EventHandler(FileSystemEventHandler):
         self.SourceDirectory = os.path.abspath(source)
         self.DestinationDirectory = os.path.abspath(destination)
         self.LogPrefix = log_prefix(self.SourceDirectory)
+        self._pending_creations: Dict[str, threading.Timer] = {}
+        self._pending_lock = threading.Lock()
+
+    def IsTracked(self, pathname: str) -> bool:
+        return (
+            pathname.endswith(config["extensions"])
+            and os.path.basename(pathname) not in config["ignore_names"]
+            and not path_is_ignored(pathname)
+        )
+
+    def RemotePath(self, pathname: str) -> str:
+        return os.path.join(
+            self.DestinationDirectory,
+            os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
+        )
+
+    def Reconcile(self) -> None:
+        reconciler.schedule(self.SourceDirectory, self.DestinationDirectory)
+
+    def CancelPendingCreation(self, pathname: str) -> bool:
+        """Drop a deferred creation. Returns True if one was pending."""
+        with self._pending_lock:
+            timer = self._pending_creations.pop(pathname, None)
+        if timer is None:
+            return False
+        timer.cancel()
+        return True
+
+    def QueueCompress(self, pathname: str) -> None:
+        if not queue_has_headroom():
+            return
+        jobs.put(
+            (
+                AsyncFunc.Compress,
+                pathname,
+                self.RemotePath(pathname) + ".bz2",
+                self.LogPrefix,
+            )
+        )
 
     def on_closed(self, event: FileSystemEvent) -> None:
         if event.is_directory:
             return
         pathname = os.fsdecode(event.src_path)
         logger.debug(f"on_closed: {pathname}")
-        if (
-            not pathname.endswith(config["extensions"])
-            or os.path.basename(pathname) in config["ignore_names"]
-            or any(folder in pathname for folder in config["ignore_folders"])
-        ):
+        if not self.IsTracked(pathname):
             return
 
-        destpath = os.path.join(
-            self.DestinationDirectory,
-            os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
-        )
-        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2", self.LogPrefix))
-        jobs.put(
-            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
-        )
+        # A normal write emits create *and* close. Cancel the deferred creation
+        # so the file is compressed and uploaded exactly once.
+        self.CancelPendingCreation(pathname)
+
+        self.QueueCompress(pathname)
+        self.Reconcile()
 
     def on_created(self, event: FileSystemEvent) -> None:
         # Handle files moved into the watched directory from an untracked location.
@@ -712,62 +877,57 @@ class EventHandler(FileSystemEventHandler):
             return
         pathname = os.fsdecode(event.src_path)
         logger.debug(f"on_created: {pathname}")
-        if (
-            not pathname.endswith(config["extensions"])
-            or os.path.basename(pathname) in config["ignore_names"]
-            or any(folder in pathname for folder in config["ignore_folders"])
-        ):
+        if not self.IsTracked(pathname):
             return
 
-        destpath = os.path.join(
-            self.DestinationDirectory,
-            os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
-        )
-        jobs.put((AsyncFunc.Compress, pathname, destpath + ".bz2", self.LogPrefix))
-        jobs.put(
-            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
-        )
+        # Defer: if a close event follows (an ordinary write still in progress)
+        # it cancels this and handles the upload itself. Only files that are
+        # never closed -- moved in from outside the watch -- land here.
+        grace = config_int("created_grace_seconds", DEFAULT_CREATED_GRACE)
+
+        def fire() -> None:
+            with self._pending_lock:
+                self._pending_creations.pop(pathname, None)
+            logger.debug(f"No close event for {pathname}, treating as complete")
+            self.QueueCompress(pathname)
+            self.Reconcile()
+
+        timer = threading.Timer(grace, fire)
+        timer.daemon = True
+        with self._pending_lock:
+            existing = self._pending_creations.pop(pathname, None)
+            self._pending_creations[pathname] = timer
+        if existing is not None:
+            existing.cancel()
+        timer.start()
 
     def on_deleted(self, event: FileSystemEvent) -> None:
         pathname = os.fsdecode(event.src_path)
         logger.debug(f"on_deleted: {pathname}")
-        destpath = os.path.join(
-            self.DestinationDirectory,
-            os.path.relpath(pathname, os.path.join(self.SourceDirectory, "..")),
-        )
+        destpath = self.RemotePath(pathname)
+        self.CancelPendingCreation(pathname)
         if event.is_directory:
             # destpath lives on the FTP server; whether it exists is decided by
             # the worker holding the connection, not by the local filesystem.
             jobs.put((AsyncFunc.Delete, destpath, True))
         else:
-            if (
-                not pathname.endswith(config["extensions"])
-                or os.path.basename(pathname) in config["ignore_names"]
-                or any(folder in pathname for folder in config["ignore_folders"])
-            ):
+            if not self.IsTracked(pathname):
                 return
 
             if not AutoRemove.WasFileRemovedAfterUpload(pathname):
                 jobs.put((AsyncFunc.Delete, destpath + ".bz2", False))
             else:
                 logger.info(f"Keeping remote file {destpath}.bz2")
-        jobs.put(
-            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
-        )
+        self.Reconcile()
 
     def on_moved(self, event: FileSystemEvent) -> None:
         src_path = os.fsdecode(event.src_path)
         dest_path = os.fsdecode(event.dest_path)
         logger.debug(f"on_moved: {src_path} -> {dest_path}")
         # Moved inside tracked directory, handle as rename
-        sourcepath = os.path.join(
-            self.DestinationDirectory,
-            os.path.relpath(src_path, os.path.join(self.SourceDirectory, "..")),
-        )
-        destpath = os.path.join(
-            self.DestinationDirectory,
-            os.path.relpath(dest_path, os.path.join(self.SourceDirectory, "..")),
-        )
+        self.CancelPendingCreation(src_path)
+        sourcepath = self.RemotePath(src_path)
+        destpath = self.RemotePath(dest_path)
 
         if event.is_directory:
             jobs.put((AsyncFunc.Move, sourcepath, destpath))
@@ -781,7 +941,7 @@ class EventHandler(FileSystemEventHandler):
                 not source_tracked
                 and not dest_tracked
                 or os.path.basename(dest_path) in config["ignore_names"]
-                or any(folder in dest_path for folder in config["ignore_folders"])
+                or path_is_ignored(dest_path)
             ):
                 return
 
@@ -803,9 +963,7 @@ class EventHandler(FileSystemEventHandler):
                 return
 
             jobs.put((AsyncFunc.Move, sourcepath + ".bz2", destpath + ".bz2"))
-        jobs.put(
-            (AsyncFunc.CheckAllFiles, self.SourceDirectory, self.DestinationDirectory)
-        )
+        self.Reconcile()
 
 
 class DirectoryHandler:
@@ -840,13 +998,13 @@ class DirectoryHandler:
 
     def Do(self, ftp: ftplib.FTP) -> None:  # Normal mode
         for dirpath, _dirnames, filenames in os.walk(self.SourceDirectory):
-            if not any(folder in dirpath for folder in config["ignore_folders"]):
+            if not path_is_ignored(dirpath):
 
                 destdirectory = os.path.join(
                     self.DestinationDirectory,
                     os.path.relpath(dirpath, os.path.join(self.SourceDirectory, "..")),
                 )
-                jobs.put((AsyncFunc.CheckDirFTP, destdirectory))
+                jobs.put((AsyncFunc.CheckDirFTP, destdirectory, "startup_clean"))
 
                 filenames.sort()
                 for filename in [
@@ -883,26 +1041,55 @@ class DirectoryHandler:
             jobs.put((AsyncFunc.CheckFileAdd, sourcefile, commonprefix, destfile))
 
 
-def main() -> None:
-    global config
-    with open("config.json", "r") as jsonfile:
-        config = json.load(jsonfile)
+def setup_logging(debug: bool, docker: bool) -> None:
+    """
+    Configure the root logger.
 
-    config["extensions"] = tuple(config["extensions"])
-
-    # Configure logging before anything that can fail, so startup errors are
-    # emitted through the configured handler instead of the fallback one.
-    log_level = logging.INFO
-    if config["debug"]:
-        log_level = logging.DEBUG
+    Under `docker`, timestamps are omitted: the container runtime already
+    stamps every line it collects, so emitting our own duplicates them in
+    `docker logs` and in anything downstream of it.
+    """
+    if docker:
+        logging.basicConfig(
+            level=logging.DEBUG if debug else logging.INFO,
+            format="%(levelname)s | %(message)s",
+            stream=sys.stdout,
+        )
+        return
 
     logging.basicConfig(
-        level=log_level,
+        level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
 
+
+def main() -> None:
+    global config
+
+    try:
+        path = configuration.config_path(sys.argv[1:])
+        config = configuration.load(path)
+    except configuration.ConfigError as e:
+        # Logging is not configured yet, and the message must not be swallowed.
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(EXIT_FAILURE)
+
+    # Configure logging before anything that can fail, so startup errors are
+    # emitted through the configured handler instead of the fallback one.
+    setup_logging(config["debug"], config["docker"])
+
     logger.info("AutoFastDL started")
+    logger.debug(f"Configuration loaded from {path}")
+
+    for source in configuration.missing_sources(config):
+        logger.warning(f"Source directory does not exist yet: {source}")
+
+    if config["ftp_protocol"] == "ftp":
+        logger.warning(
+            "Using plaintext FTP: credentials and file contents are sent "
+            "unencrypted. Set ftp_protocol to 'ftps' if the server supports it."
+        )
 
     try:
         ftp = FTPHelper.GetConnection()
@@ -916,6 +1103,9 @@ def main() -> None:
 
     global jobs
     jobs = queue.Queue()
+
+    global reconciler
+    reconciler = Reconciler()
 
     # Create initial jobs
     observer = Observer()
@@ -932,6 +1122,9 @@ def main() -> None:
         worker_thread = threading.Thread(target=FTPHelper.Worker)
         worker_thread.daemon = True
         worker_thread.start()
+
+    # Coalesces reconciliation passes instead of one per filesystem event
+    reconciler.start()
 
     # filesystem event loop
     observer.start()

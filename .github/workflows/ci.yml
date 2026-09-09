@@ -51,8 +51,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      # tests/ arrives with the test-suite PR; until then lint src only,
-      # so this job does not depend on the order those branches land in.
+      # Lint src plus tests/ when it is present.
       - name: Resolve lint targets
         id: targets
         run: |
