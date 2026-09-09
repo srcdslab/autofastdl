@@ -35,7 +35,7 @@ extra_dependencies["dev"] = extra_dependencies["all"] + [
     "flake8-bugbear",
     "flake8-quotes",
     "isort",
-    "black==22.10.0",
+    "black==26.5.1",
     "mypy>=0.982",
 ]
 
