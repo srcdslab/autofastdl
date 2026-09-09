@@ -37,6 +37,9 @@ extra_dependencies["dev"] = extra_dependencies["all"] + [
     "isort",
     "black==26.5.1",
     "mypy>=0.982",
+    # Testing
+    "pytest>=7.0",
+    "pytest-env",
 ]
 
 setup(
