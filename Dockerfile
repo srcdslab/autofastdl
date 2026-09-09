@@ -1,7 +1,7 @@
 # Pinned to an official image. The previous base, frolvlad/alpine-python3, was
 # untagged (:latest) and unmaintained, so the Python version actually shipped
 # in production was whatever that image last happened to build with.
-FROM python:3.12-alpine
+FROM python:3.14-alpine
 
 WORKDIR /app
 
