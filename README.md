@@ -43,7 +43,7 @@ pip install .
 autofastdl --config /etc/autofastdl/config.json
 ```
 
-Requires Python 3.9 or newer.
+Requires Python 3.10 or newer.
 
 ## Configuration
 
@@ -181,7 +181,7 @@ black src tests     # format
 isort src tests     # import order
 ```
 
-CI runs all of the above on Python 3.9, 3.11 and 3.12; the image is only
+CI runs all of the above on Python 3.10, 3.11 and 3.12; the image is only
 published if they pass.
 
 ## Licence
