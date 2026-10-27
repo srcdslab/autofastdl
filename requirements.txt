@@ -4,9 +4,11 @@
 #
 #    pip-compile requirements.in
 #
-python-dateutil==2.9.0.post0
+python-dateutil==3.0.0
     # via -r requirements.in
 six==1.17.0
+    # via python-dateutil
+tzdata==2026.5
     # via python-dateutil
 watchdog==6.0.0
     # via -r requirements.in
