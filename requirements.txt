@@ -10,5 +10,5 @@ six==1.17.0
     # via python-dateutil
 tzdata==2026.5
     # via python-dateutil
-watchdog==6.0.0
+watchdog==7.0.0
     # via -r requirements.in
