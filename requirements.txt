@@ -8,5 +8,5 @@ python-dateutil==4.0.0
     # via -r requirements.in
 tzdata==2026.5
     # via python-dateutil
-watchdog==7.0.0
+watchdog==7.1.0
     # via -r requirements.in
